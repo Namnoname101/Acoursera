@@ -60,6 +60,171 @@ public partial class MainWindow : Window
             ");
         }
         catch { }
+
+    }
+
+    private bool _isHandlingDialogue = false;
+
+    private async Task HandleDialogueAsync()
+    {
+        if (_isHandlingDialogue) return;
+        _isHandlingDialogue = true;
+
+        try
+        {
+            if (await CheckForLockedScreenAndReloadAsync()) return;
+
+            _viewModel.StatusText = "💬 Phát hiện bài Dialogue. Đang tìm nút Start...";
+            await Task.Delay(3000);
+            await DismissAnyGlobalPopupsAsync();
+
+            // Thử click Start Dialogue tối đa 10 lần (30 giây)
+            bool clicked = false;
+            for (int attempt = 0; attempt < 10; attempt++)
+            {
+                string jsClick = @"
+                    (function() {
+                        // Kiểm tra xem có đang ở sẵn trong chat không (nếu đã start từ trước)
+                        var ta = document.querySelector('textarea');
+                        var endBtn = Array.from(document.querySelectorAll('button')).find(b => (b.innerText || '').trim().toLowerCase().includes('end dialogue'));
+                        if (ta || endBtn) {
+                            return 'ALREADY_STARTED';
+                        }
+
+                        // Cách 1: Tìm span chứa text 'Start Dialogue' rồi click button cha
+                        var spans = Array.from(document.querySelectorAll('span.cds-button-label'));
+                        for (var i = 0; i < spans.length; i++) {
+                            if (spans[i].textContent.trim() === 'Start Dialogue') {
+                                var btn = spans[i].closest('button');
+                                if (btn) { btn.click(); return 'CLICKED_VIA_SPAN'; }
+                            }
+                        }
+                        // Cách 2: Tìm button có class cds-button-primary chứa text Start Dialogue
+                        var btns = Array.from(document.querySelectorAll('button.cds-button-primary, button[class*=""cds-button-primary""]'));
+                        for (var j = 0; j < btns.length; j++) {
+                            if ((btns[j].textContent || '').trim().toLowerCase().includes('start dialogue')) {
+                                btns[j].click();
+                                return 'CLICKED_VIA_CLASS';
+                            }
+                        }
+                        // Cách 3: Brute force - quét toàn bộ button
+                        var allBtns = Array.from(document.querySelectorAll('button'));
+                        for (var k = 0; k < allBtns.length; k++) {
+                            if ((allBtns[k].textContent || '').trim().toLowerCase().includes('start dialogue')) {
+                                allBtns[k].click();
+                                return 'CLICKED_VIA_BRUTE';
+                            }
+                        }
+                        return 'NOT_FOUND|total_buttons=' + document.querySelectorAll('button').length + '|total_spans=' + document.querySelectorAll('span').length;
+                    })();
+                ";
+
+                string result = await MainWebView.ExecuteScriptAsync(jsClick);
+                string cleaned = result?.Trim('"') ?? "";
+                _viewModel.StatusText = $"🔍 Lần {attempt + 1}: {cleaned}";
+
+                if (cleaned.StartsWith("CLICKED"))
+                {
+                    clicked = true;
+                    _viewModel.StatusText = $"▶️ Đã click Start Dialogue! ({cleaned})";
+                    break;
+                }
+                else if (cleaned == "ALREADY_STARTED")
+                {
+                    clicked = true;
+                    _viewModel.StatusText = "▶️ Đã ở trong khung Chat từ trước! Bỏ qua bấm Start.";
+                    break;
+                }
+
+                await Task.Delay(3000);
+            }
+
+            if (!clicked)
+            {
+                _viewModel.StatusText = "⚠️ Không tìm thấy nút Start Dialogue sau 10 lần thử.";
+            }
+
+            // Vòng lặp chat tự động & chờ hoàn thành (tối đa 5 phút)
+            string lastQuestion = "";
+            for (int i = 0; i < 60; i++)
+            {
+                await Task.Delay(5000);
+
+                // Kiểm tra Next button & dọn dẹp các popup thừa
+                string jsNext = @"
+                    (function() {
+                        // Nhỡ bấm nhầm End Dialogue thì Cancel nó đi
+                        var cancelBtn = Array.from(document.querySelectorAll('button')).find(b => (b.innerText || '').trim().toLowerCase() === 'cancel');
+                        var yesEndBtn = Array.from(document.querySelectorAll('button')).find(b => (b.innerText || '').trim().toLowerCase().includes('end the dialogue'));
+                        if (cancelBtn && yesEndBtn) {
+                            cancelBtn.click();
+                        }
+
+                        var nextBtn = document.querySelector('button[aria-label=""Go to next item""]');
+                        if (nextBtn && nextBtn.className.includes('cds-button-primary')) {
+                            nextBtn.click();
+                            return 'NEXT';
+                        }
+                        return 'WAIT';
+                    })();
+                ";
+                try
+                {
+                    string r = await MainWebView.ExecuteScriptAsync(jsNext);
+                    if (r != null && r.Contains("NEXT"))
+                    {
+                        _viewModel.StatusText = "✅ Bài Dialogue hoàn thành! Đang chuyển bài.";
+                        return;
+                    }
+                } catch { }
+
+                // Nếu chưa xong, kiểm tra xem có thể dùng Trick "End Dialogue" để pass luôn không
+                string jsEndTrick = @"
+                    (function() {
+                        // Bấm 'Yes, end the Dialogue' nếu popup đang mở
+                        var yesEndBtn = Array.from(document.querySelectorAll('button')).find(b => (b.innerText || '').trim().toLowerCase().includes('end the dialogue'));
+                        if (yesEndBtn) {
+                            yesEndBtn.click();
+                            return 'CLICKED_YES';
+                        }
+
+                        // Nếu chưa có popup, tìm nút 'End Dialogue' góc trên phải
+                        var endBtn = Array.from(document.querySelectorAll('button')).find(b => (b.innerText || '').trim().toLowerCase() === 'end dialogue');
+                        if (endBtn) {
+                            endBtn.click();
+                            return 'CLICKED_END';
+                        }
+                        
+                        return 'WAITING';
+                    })();
+                ";
+                
+                try
+                {
+                    string trickResult = await MainWebView.ExecuteScriptAsync(jsEndTrick);
+                    if (trickResult != null)
+                    {
+                        if (trickResult.Contains("CLICKED_END"))
+                            _viewModel.StatusText = "⚡ Dùng trick: Đã bấm End Dialogue! Chờ xác nhận...";
+                        else if (trickResult.Contains("CLICKED_YES"))
+                            _viewModel.StatusText = "⚡ Dùng trick: Đã xác nhận End! Chờ nút Next sáng lên...";
+                    }
+                }
+                catch { }
+
+                _viewModel.StatusText = $"⏳ Dialogue đang chạy & Auto-Trick... ({(i + 1) * 5}s)";
+            }
+
+            await CheckLessonCompletedAndClickNextAsync();
+        }
+        catch (Exception ex)
+        {
+            _viewModel.StatusText = "❌ Lỗi Dialogue: " + ex.Message;
+        }
+        finally
+        {
+            _isHandlingDialogue = false;
+        }
     }
 
     private string _lastReloadedUrl = "";
@@ -134,7 +299,7 @@ public partial class MainWindow : Window
         return false;
     }
 
-    private async Task<bool> CheckLessonCompletedAndClickNextAsync()
+    private async Task<bool> CheckLessonCompletedAndClickNextAsync(bool isInitialCheck = false)
     {
         string jsCheck = @"
             (function() {
@@ -150,7 +315,10 @@ public partial class MainWindow : Window
                 
                 // Cảm biến Cul-de-sac (Ngõ cụt): Không có nút Next, nhưng trang đã load xong
                 var isPageLoaded = document.querySelector('div[data-testid=""page-header-wrapper""]') !== null || document.querySelector('.rc-MetatagsWrapper') !== null;
-                if (isPageLoaded && !nextBtn) {
+                // Nếu đang ở bài thi (exam/quiz) hoặc dialogue mà không thấy nút Next thì ĐÓ LÀ BÌNH THƯỜNG (chưa làm xong), không phải ngõ cụt!
+                var isExam = window.location.href.includes('/exam/') || window.location.href.includes('/quiz/') || window.location.href.includes('/dialogue/') || window.location.href.includes('/coach/');
+                
+                if (isPageLoaded && !nextBtn && !isExam) {
                     return 'END_OF_COURSE';
                 }
                 
@@ -165,10 +333,10 @@ public partial class MainWindow : Window
             
             result = result.Trim('"');
             
-            if (result == "END_OF_COURSE")
+            if (result == "END_OF_COURSE" && !isInitialCheck)
             {
                 // Ngõ cụt! Trở về trang chủ để cơ chế CheckModules quét lại (Sweep)
-                string currentUrl = MainWebView.Source.ToString();
+                string currentUrl = MainWebView.Source?.ToString() ?? "";
                 int learnIndex = currentUrl.IndexOf("/learn/");
                 if (learnIndex != -1)
                 {
@@ -594,18 +762,96 @@ public partial class MainWindow : Window
         try
         {
             _viewModel.StatusText = "📝 Đang kiểm tra bài Trắc nghiệm (Quiz)...";
-            await Task.Delay(2000); 
+            await Task.Delay(3000); 
             
             if (await CheckForLockedScreenAndReloadAsync()) return;
             
             await DismissAnyGlobalPopupsAsync();
 
-        // BỎ QUA NẾU ĐÃ XONG
-        if (await CheckLessonCompletedAndClickNextAsync())
+        // ========== BƯỚC 1: CHECK TRẠNG THÁI PASS/FAIL ==========
+        string jsCheckPassStatus = @"
+            (function() {
+                var bodyText = document.body.innerText;
+                
+                // Tìm chữ 'You passed!' trên trang
+                var hasPassed = bodyText.includes('You passed!');
+                
+                // Tìm chữ 'You didn\'t pass' hoặc tương tự
+                var hasFailed = bodyText.includes('You didn') || bodyText.includes('not pass') || bodyText.includes('didn\'t pass');
+                
+                // Tìm nút Start/Resume/Retake (nghĩa là chưa vào làm bài)
+                var btns = Array.from(document.querySelectorAll('button, a'));
+                var hasStartBtn = btns.some(b => {
+                    var t = (b.innerText || '').trim().toLowerCase();
+                    return t === 'start assignment' || t === 'resume assignment';
+                });
+                var hasRetakeBtn = btns.some(b => {
+                    var t = (b.innerText || '').trim().toLowerCase();
+                    return t === 'retake assignment' || t === 'try again' || t === 'retry';
+                });
+                var hasFeedbackBtn = btns.some(b => {
+                    var t = (b.innerText || '').trim().toLowerCase();
+                    return t === 'view feedback';
+                });
+                
+                // Tìm nút Next
+                var nextBtn = document.querySelector('button[aria-label=""Go to next item""]');
+                var hasNextPrimary = nextBtn && nextBtn.className.includes('cds-button-primary');
+                
+                if (hasPassed) {
+                    return 'PASSED|hasNext=' + !!hasNextPrimary;
+                } else if (hasFailed || hasRetakeBtn) {
+                    return 'FAILED|hasFeedback=' + hasFeedbackBtn + '|hasRetake=' + hasRetakeBtn;
+                } else if (hasStartBtn) {
+                    return 'NEW';
+                }
+                return 'UNKNOWN';
+            })();
+        ";
+
+        string statusResult = "";
+        try
         {
-            _viewModel.StatusText = "⏭️ Quiz này đã Pass! Đang chuyển bài tiếp theo...";
+            statusResult = (await MainWebView.ExecuteScriptAsync(jsCheckPassStatus))?.Trim('"') ?? "";
+            _viewModel.StatusText = $"🔍 Trạng thái Quiz: {statusResult}";
+        }
+        catch { }
+
+        // ========== BƯỚC 2: XỬ LÝ TỪNG TRẠNG THÁI ==========
+        
+        // --- TRẠNG THÁI 1: ĐÃ PASS ---
+        if (statusResult.StartsWith("PASSED"))
+        {
+            _viewModel.StatusText = "✅ Quiz này đã Pass! Đang chuyển bài tiếp theo...";
+            
+            // Thử bấm Next
+            if (await CheckLessonCompletedAndClickNextAsync(true))
+            {
+                _viewModel.StatusText = "⏭️ Đã Pass và chuyển bài thành công!";
+                return;
+            }
+            
+            // Nếu không có Next → Đây là bài cuối → Về trang chủ
+            _viewModel.StatusText = "🏆 Đã Pass bài cuối cùng! Khoá học hoàn thành! Quay về Trang chủ...";
+            string currentUrl = MainWebView.Source?.ToString() ?? "";
+            int learnIndex = currentUrl.IndexOf("/learn/");
+            if (learnIndex != -1)
+            {
+                int nextSlash = currentUrl.IndexOf("/", learnIndex + 7);
+                string courseSlug = nextSlash != -1 
+                    ? currentUrl.Substring(learnIndex + 7, nextSlash - (learnIndex + 7))
+                    : currentUrl.Substring(learnIndex + 7);
+                
+                MainWebView.Source = new Uri($"https://www.coursera.org/learn/{courseSlug}/home/welcome");
+            }
             return;
         }
+
+        // --- TRẠNG THÁI 2: ĐÃ LÀM NHƯNG CHƯA ĐẠT (FAILED) ---
+        // Logic: Đọc Feedback để học câu sai → Retake
+        
+        // --- TRẠNG THÁI 3: CHƯA LÀM (NEW) hoặc UNKNOWN ---
+        // Logic: Bấm Start Assignment → Làm bài
 
         try 
         {
@@ -857,9 +1103,165 @@ public partial class MainWindow : Window
         }
     }
 
+    private async Task SolveOpenEndedQuizAsync()
+    {
+        _viewModel.StatusText = "✍️ Đang quét câu hỏi tự luận...";
+
+        string jsExtractOpen = @"
+            (function() {
+                var parts = [];
+                var qElements = document.querySelectorAll('div[data-testid^=""part-Submission_""]');
+                qElements.forEach((q, index) => {
+                    var promptEl = q.querySelector('div[id^=""prompt-""]');
+                    var questionText = promptEl ? promptEl.innerText.trim() : '';
+                    var ta = q.querySelector('textarea');
+                    if (questionText && ta) {
+                        parts.push({ Index: index, Question: questionText, TextareaId: ta.id || '' });
+                    }
+                });
+                return JSON.stringify(parts);
+            })();
+        ";
+
+        string raw = await MainWebView.ExecuteScriptAsync(jsExtractOpen);
+        if (string.IsNullOrEmpty(raw) || raw == "null" || raw == "\"[]\"") 
+        {
+            _viewModel.StatusText = "⚠️ Không đọc được câu hỏi tự luận.";
+            return;
+        }
+
+        string json;
+        try
+        {
+            raw = raw.Trim('"');
+            json = System.Text.RegularExpressions.Regex.Unescape(raw);
+            // Nếu json vẫn bị bọc nháy thì bỏ bọc
+            if (json.StartsWith("[") == false)
+                json = System.Text.RegularExpressions.Regex.Unescape(
+                    raw.Substring(1, raw.Length - 2));
+        }
+        catch { json = raw; }
+
+        List<dynamic> parts;
+        try
+        {
+            using var doc = System.Text.Json.JsonDocument.Parse(json);
+            var arr = doc.RootElement;
+            for (int i = 0; i < arr.GetArrayLength(); i++)
+            {
+                var item = arr[i];
+                string questionText = item.GetProperty("Question").GetString();
+                string taId = item.GetProperty("TextareaId").GetString();
+                int qIndex = item.GetProperty("Index").GetInt32();
+
+                _viewModel.StatusText = $"🤖 Đang hỏi AI câu {i + 1}...";
+                string aiAnswer = await GetAnswerFromDeepSeekAsync(
+                    questionText, isDiscussion: true,
+                    customSystemPrompt: "You are a student completing a reflective activity. Answer the question thoughtfully in 2-3 sentences in English. Be specific and personal-sounding. Return ONLY the answer text, no preamble.");
+
+                if (aiAnswer.StartsWith("ERROR")) continue;
+                aiAnswer = aiAnswer.Trim('"').Trim();
+
+                // Inject vào textarea dùng _valueTracker bypass
+                string jsInject = $@"
+                    (function() {{
+                        var ta = document.querySelectorAll('div[data-testid^=""part-Submission_""]')[{qIndex}]?.querySelector('textarea');
+                        if (!ta && '{taId}' !== '') ta = document.getElementById('{taId}');
+                        if (ta) {{
+                            var nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set;
+                            nativeSetter.call(ta, {System.Text.Json.JsonSerializer.Serialize(aiAnswer)});
+                            ta.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                            ta.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                            return 'OK';
+                        }}
+                        return 'NOT_FOUND';
+                    }})();
+                ";
+                await MainWebView.ExecuteScriptAsync(jsInject);
+                await Task.Delay(800);
+                _viewModel.StatusText = $"✅ Đã điền câu {i + 1}/{arr.GetArrayLength()}";
+            }
+        }
+        catch (Exception ex)
+        {
+            _viewModel.StatusText = "❌ Lỗi khi điền câu tự luận: " + ex.Message;
+            return;
+        }
+
+        // Cuộn xuống và Submit
+        _viewModel.StatusText = "🚀 Đã điền xong! Đang cuộn xuống và nộp bài...";
+        await MainWebView.ExecuteScriptAsync("window.scrollTo(0, document.body.scrollHeight);");
+        await Task.Delay(1000);
+
+        string jsSubmit = @"
+            (function() {
+                var honorCode = document.getElementById('agreement-checkbox-base');
+                if (honorCode && !honorCode.checked) honorCode.click();
+                
+                var submitBtn = document.querySelector('button[data-testid=""submit-button""]');
+                if (submitBtn) submitBtn.scrollIntoView({ block: 'center' });
+                
+                setTimeout(function() {
+                    var btn = document.querySelector('button[data-testid=""submit-button""]');
+                    if (btn && !btn.disabled) btn.click();
+                }, 500);
+            })();
+        ";
+        await MainWebView.ExecuteScriptAsync(jsSubmit);
+        await Task.Delay(2500);
+
+        // Confirm popup nếu có
+        string jsConfirm = @"
+            (function() {
+                var dialogs = document.querySelectorAll('div[role=""dialog""]');
+                var clicked = false;
+                
+                // Cách 1: Tìm trong dialog
+                for (var d of dialogs) {
+                    var btns = Array.from(d.querySelectorAll('button'));
+                    var ok = btns.find(b => {
+                        var t = (b.innerText || '').trim().toLowerCase();
+                        return (t === 'submit' || t === 'yes' || t === 'confirm') && 
+                               b.getAttribute('data-testid') !== 'submit-button';
+                    });
+                    if (ok) { ok.click(); clicked = true; break; }
+                }
+                
+                // Cách 2: Quét toàn bộ trang tìm nút Submit thứ 2 (popup)
+                if (!clicked) {
+                    var allBtns = Array.from(document.querySelectorAll('button'));
+                    var secondarySubmit = allBtns.find(b => 
+                        (b.innerText || '').trim().toLowerCase() === 'submit' && 
+                        b.getAttribute('data-testid') !== 'submit-button' &&
+                        b.offsetWidth > 0
+                    );
+                    if (secondarySubmit) {
+                        secondarySubmit.click();
+                    }
+                }
+            })();
+        ";
+        await MainWebView.ExecuteScriptAsync(jsConfirm);
+
+        _viewModel.StatusText = "🏆 Đã nộp bài tự luận! Đang tải lại trang...";
+        await Task.Delay(8000);
+        _hasExtractedFeedbackThisSession = false;
+        MainWebView.Reload();
+    }
+
     private async Task SolveQuizQuestionsAsync()
     {
         _viewModel.StatusText = "🔍 Đang quét toàn bộ đề thi...";
+
+        // Ưu tiên: Nếu là quiz tự luận (textarea) thì dùng handler riêng
+        var taCountRaw = await MainWebView.ExecuteScriptAsync(
+            "(function(){var c=0;document.querySelectorAll('div[data-testid^=\"part-Submission_\"]').forEach(q=>{if(q.querySelector('textarea'))c++;});return c;})()");
+        if (int.TryParse(taCountRaw, out int taNum) && taNum > 0)
+        {
+            _viewModel.StatusText = $"✍️ Phát hiện {taNum} câu tự luận! Chuyển sang chế độ Essay...";
+            await SolveOpenEndedQuizAsync();
+            return;
+        }
         
         string jsExtract = @"
             (function() {
@@ -1716,17 +2118,17 @@ public partial class MainWindow : Window
 
     private async void MainWebView_SourceChanged(object sender, Microsoft.Web.WebView2.Core.CoreWebView2SourceChangedEventArgs e)
     {
-        string currenUrl = MainWebView.Source.ToString();
+        string currenUrl = MainWebView.Source?.ToString()?.ToLower() ?? "";
         
         if (currenUrl.Contains("/lecture/"))
         {
             await HandleVideoLessonAsync();
         }
-        else if (currenUrl.Contains("/ungradedWidget/"))
+        else if (currenUrl.Contains("/ungradedwidget/"))
         {
             await HandleUngradedWidgetAsync();
         }
-        else if (currenUrl.Contains("/ungradedLti/") || currenUrl.Contains("/lti/"))
+        else if (currenUrl.Contains("/ungradedlti/") || currenUrl.Contains("/lti/"))
         {
             await HandleUngradedAppAsync();
         }
@@ -1734,7 +2136,7 @@ public partial class MainWindow : Window
         {
             await HandleQuizAsync();
         }
-        else if (currenUrl.Contains("/discussionPrompt/"))
+        else if (currenUrl.Contains("/discussionprompt/"))
         {
             await HandleDiscussionAsync();
         }
@@ -1752,6 +2154,10 @@ public partial class MainWindow : Window
             {
                 await HandlePeerAssignmentAsync();
             }
+        }
+        else if (currenUrl.Contains("/coach/") || currenUrl.Contains("/dialogue/"))
+        {
+            await HandleDialogueAsync();
         }
     }
 
@@ -1792,6 +2198,7 @@ public partial class MainWindow : Window
             {
                 await HandleReadingLessonAsync();
             }
+
             else if (currenUrl.Contains("/peer/"))
             {
                 if (currenUrl.Contains("give-feedback") || currenUrl.Contains("review"))
@@ -1802,6 +2209,10 @@ public partial class MainWindow : Window
                 {
                     await HandlePeerAssignmentAsync();
                 }
+            }
+            else if (currenUrl.Contains("/coach/") || currenUrl.Contains("/dialogue/"))
+            {
+                await HandleDialogueAsync();
             }
             // Trang giới thiệu khoá học (bên ngoài)
             else if (currenUrl.Contains("/learn/"))
