@@ -1,0 +1,5 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <ItemGroup>
+    <ProjectReference Include="..\AutomationPlatform.Domain\AutomationPlatform.Domain.csproj" />
+  </ItemGroup>
+</Project>

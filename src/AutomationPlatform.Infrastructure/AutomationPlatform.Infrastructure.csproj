@@ -1,0 +1,10 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Playwright" />
+    <PackageReference Include="Microsoft.Data.Sqlite" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\AutomationPlatform.Application\AutomationPlatform.Application.csproj" />
+    <ProjectReference Include="..\AutomationPlatform.Domain\AutomationPlatform.Domain.csproj" />
+  </ItemGroup>
+</Project>
