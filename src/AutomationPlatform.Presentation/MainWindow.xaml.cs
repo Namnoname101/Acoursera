@@ -31,8 +31,39 @@ public partial class MainWindow : Window
     {
         try
         {
+            // Thay vì dùng ZoomFactor (chỉ scale hình ảnh nhưng không đổi CSS Viewport),
+            // Ta dùng DevTools Protocol để ép cứng Viewport logic luôn là 1920px.
+            MainWebView.SizeChanged += async (s, args) =>
+            {
+                if (MainWebView.CoreWebView2 == null) return;
+                
+                double targetWidth = 1920.0;
+                double actualWidth = MainWebView.ActualWidth;
+                double actualHeight = MainWebView.ActualHeight;
+
+                if (actualWidth > 0 && actualHeight > 0)
+                {
+                    double scale = actualWidth < targetWidth ? actualWidth / targetWidth : 1.0;
+                    int virtualHeight = (int)(actualHeight / scale);
+
+                    string payload = $@"{{
+                        ""width"": 1920,
+                        ""height"": {virtualHeight},
+                        ""deviceScaleFactor"": 1,
+                        ""mobile"": false,
+                        ""scale"": {scale.ToString(System.Globalization.CultureInfo.InvariantCulture)}
+                    }}";
+
+                    try
+                    {
+                        await MainWebView.CoreWebView2.CallDevToolsProtocolMethodAsync("Emulation.setDeviceMetricsOverride", payload);
+                    }
+                    catch { }
+                }
+            };
+
             // Cài đặt User-Agent chuyên dụng đã vượt qua bài test Lockdown Browser
-            MainWebView.CoreWebView2InitializationCompleted += (s, args) => {
+            MainWebView.CoreWebView2InitializationCompleted += async (s, args) => {
                 if (args.IsSuccess) {
                     MainWebView.CoreWebView2.Settings.UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 coursera-locking-browser/0.6.5";
                     
@@ -46,6 +77,44 @@ public partial class MainWindow : Window
                             eventArgs.Cancel = true; // Chặn chuyển trang
                         }
                     };
+
+                    /* =========================================================================================
+                     * GIẢI THÍCH LOGIC ÉP BUỘC GIAO DIỆN DESKTOP (1920px)
+                     * =========================================================================================
+                     * Mục đích: Coursera dùng CSS Media Queries để ẩn Sidebar nếu cửa sổ trình duyệt nhỏ.
+                     * Giải pháp: Sử dụng Chrome DevTools Protocol (CDP) lệnh `Emulation.setDeviceMetricsOverride`.
+                     * 
+                     * Tại sao không dùng MainWebView.ZoomFactor?
+                     * - ZoomFactor chỉ phóng to/thu nhỏ hình ảnh (như Ctrl + / Ctrl -). 
+                     * - Khi cửa sổ nhỏ (VD: 900px), ZoomFactor sẽ làm chữ nhỏ lại, nhưng Coursera vẫn
+                     *   thấy cửa sổ 900px -> kích hoạt giao diện Mobile -> Ẩn Sidebar.
+                     * 
+                     * Lợi ích của CDP (setDeviceMetricsOverride):
+                     * - `width`: Bắt buộc trình duyệt "tin" rằng màn hình luôn rộng 1920px (Desktop chuẩn).
+                     * - `scale`: Tự động co rút toàn bộ khung hình 1920px này chui lọt vào cửa sổ WPF thực tế.
+                     * - Kết quả: Sidebar luôn hiển thị đầy đủ, không bao giờ bị chuyển sang chế độ Mobile.
+                     * ========================================================================================= */
+                    
+                    // Gọi ngay 1 lần lúc vừa khởi tạo xong để không cần chờ resize
+                    double targetWidth = 1920.0;
+                    double actualWidth = MainWebView.ActualWidth;
+                    double actualHeight = MainWebView.ActualHeight;
+
+                    if (actualWidth > 0 && actualHeight > 0)
+                    {
+                        double scale = actualWidth < targetWidth ? actualWidth / targetWidth : 1.0;
+                        int virtualHeight = (int)(actualHeight / scale);
+
+                        string payload = $@"{{
+                            ""width"": 1920,
+                            ""height"": {virtualHeight},
+                            ""deviceScaleFactor"": 1,
+                            ""mobile"": false,
+                            ""scale"": {scale.ToString(System.Globalization.CultureInfo.InvariantCulture)}
+                        }}";
+
+                        try { await MainWebView.CoreWebView2.CallDevToolsProtocolMethodAsync("Emulation.setDeviceMetricsOverride", payload); } catch { }
+                    }
                 }
             };
             var options = new Microsoft.Web.WebView2.Core.CoreWebView2EnvironmentOptions("--remote-debugging-port=9222");
@@ -241,25 +310,17 @@ public partial class MainWindow : Window
 
         string jsCheckLocked = @"
             (function() {
-                // CHỈ kiểm tra 2 điều kiện chắc chắn:
-                
-                // Cách 1: Sidebar item đang active có aria-label chứa 'Locked'
+                // CHỈ kiểm tra aria-label của sidebar item đang active
+                // KHÔNG check body text vì sidebar có các bài khác bị khoá sẽ làm nhiễu!
                 var activeItem = document.querySelector('a[aria-current=""page""]') || 
                                  document.querySelector('li[class*=""selected""] a');
                 
                 if (activeItem) {
                     var ariaLabel = (activeItem.getAttribute('aria-label') || '').toLowerCase();
-                    if (ariaLabel.includes('locked')) {
+                    // Fix lỗi false positive: chỉ bắt đúng chữ 'locked', không bắt 'unlocked'
+                    if (/\blocked\b/i.test(ariaLabel)) {
                         return 'LOCKED';
                     }
-                }
-                
-                // Cách 2: Body text có chữ rõ ràng 'this item is locked'
-                // VÀ trang trắng trơn (không có nội dung quiz, video, bài đọc nào)
-                var bodyText = document.body.innerText.toLowerCase();
-                var hasContent = document.querySelector('.rc-LessonCollectionBody, .rc-SubmissionBody, .rc-PeerReviewBody, video, .rc-CML, textarea, div[role=""radiogroup""], .rc-FormPartsQuestion, div[data-testid*=""part-""]');
-                if (!hasContent && bodyText.includes('this item is locked')) {
-                    return 'LOCKED';
                 }
                 
                 return 'NOT_LOCKED';
@@ -749,6 +810,16 @@ public partial class MainWindow : Window
         string jsCheckPassStatus = @"
             (function() {
                 var bodyText = document.body.innerText;
+                var btns = Array.from(document.querySelectorAll('button, a'));
+                
+                // QUAN TRỌNG: Nếu có nút Start Assignment → BÀI CHƯA LÀM, không thể passed!
+                var hasStartBtn = btns.some(b => {
+                    var t = (b.innerText || '').trim().toLowerCase();
+                    return t === 'start assignment' || t === 'resume assignment';
+                });
+                if (hasStartBtn) {
+                    return 'NEW';
+                }
                 
                 // Tìm chữ 'You passed!' trên trang
                 var hasPassed = bodyText.includes('You passed!');
@@ -759,32 +830,25 @@ public partial class MainWindow : Window
                     hasPassed = true;
                 }
                 
-                // Tìm nút 'Next item' (dạng button xanh có chữ Next item)
-                var btns = Array.from(document.querySelectorAll('button, a'));
-                var hasNextItemBtn = btns.some(b => {
-                    var t = (b.innerText || '').trim().toLowerCase();
-                    return t.includes('next item');
-                });
-                if (hasNextItemBtn && !bodyText.includes('didn')) {
+                // Tìm 'Your latest:' hoặc 'Your highest:' với điểm >= 80%
+                var latestMatch = bodyText.match(/Your (?:latest|highest):\s*(\d+)%/);
+                if (latestMatch && parseInt(latestMatch[1]) >= 80) {
                     hasPassed = true;
                 }
                 
                 // Tìm chữ 'You didn\'t pass' hoặc tương tự
                 var hasFailed = bodyText.includes('You didn') || bodyText.includes('not pass') || bodyText.includes('didn\'t pass');
                 
-                // Nếu vừa có pass vừa có fail text → ưu tiên pass (có thể đang xem feedback của bài đã pass)
+                // Nếu vừa có pass vừa có fail text → ưu tiên pass nếu grade >= 80
                 if (hasPassed && hasFailed) {
-                    // Nếu có grade >= 80 thì chắc chắn pass
                     if (gradeMatch && parseInt(gradeMatch[1]) >= 80) {
+                        hasFailed = false;
+                    } else if (latestMatch && parseInt(latestMatch[1]) >= 80) {
                         hasFailed = false;
                     }
                 }
                 
-                // Tìm nút Start/Resume/Retake (nghĩa là chưa vào làm bài)
-                var hasStartBtn = btns.some(b => {
-                    var t = (b.innerText || '').trim().toLowerCase();
-                    return t === 'start assignment' || t === 'resume assignment';
-                });
+                // Tìm nút Retake / Feedback
                 var hasRetakeBtn = btns.some(b => {
                     var t = (b.innerText || '').trim().toLowerCase();
                     return t === 'retake assignment' || t === 'try again' || t === 'retry';
@@ -794,7 +858,7 @@ public partial class MainWindow : Window
                     return t === 'view feedback';
                 });
                 
-                // Tìm nút Next
+                // Tìm nút Next (navigation)
                 var nextBtn = document.querySelector('button[aria-label=""Go to next item""]');
                 var hasNextPrimary = nextBtn && nextBtn.className.includes('cds-button-primary');
                 
@@ -802,20 +866,31 @@ public partial class MainWindow : Window
                     return 'PASSED|hasNext=' + !!hasNextPrimary;
                 } else if (hasFailed) {
                     return 'FAILED|hasFeedback=' + hasFeedbackBtn + '|hasRetake=' + hasRetakeBtn;
-                } else if (hasStartBtn) {
-                    return 'NEW';
                 }
                 return 'UNKNOWN';
             })();
         ";
 
         string statusResult = "";
-        try
+        // Thử check pass tối đa 3 lần, mỗi lần cách nhau 3s (để trang load xong)
+        for (int checkAttempt = 0; checkAttempt < 3; checkAttempt++)
         {
-            statusResult = (await MainWebView.ExecuteScriptAsync(jsCheckPassStatus))?.Trim('"') ?? "";
-            _viewModel.StatusText = $"🔍 Trạng thái Quiz: {statusResult}";
+            try
+            {
+                statusResult = (await MainWebView.ExecuteScriptAsync(jsCheckPassStatus))?.Trim('"') ?? "";
+                _viewModel.StatusText = $"🔍 Trạng thái Quiz (lần {checkAttempt + 1}): {statusResult}";
+                
+                // Nếu đã xác định được rõ ràng (không phải UNKNOWN) → dừng check
+                if (statusResult.StartsWith("PASSED") || statusResult.StartsWith("FAILED") || statusResult == "NEW")
+                {
+                    break;
+                }
+            }
+            catch { }
+            
+            // Nếu UNKNOWN → chờ thêm 3s cho trang load tiếp
+            await Task.Delay(3000);
         }
-        catch { }
 
         // ========== BƯỚC 2: XỬ LÝ TỪNG TRẠNG THÁI ==========
         
