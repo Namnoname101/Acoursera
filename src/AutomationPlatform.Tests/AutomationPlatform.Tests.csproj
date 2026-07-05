@@ -1,9 +1,0 @@
-<Project Sdk="Microsoft.NET.Sdk">
-  <ItemGroup>
-    <PackageReference Include="xunit" />
-    <PackageReference Include="xunit.runner.visualstudio" />
-  </ItemGroup>
-  <ItemGroup>
-    <ProjectReference Include="..\AutomationPlatform.Domain\AutomationPlatform.Domain.csproj" />
-  </ItemGroup>
-</Project>

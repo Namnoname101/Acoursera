@@ -241,47 +241,24 @@ public partial class MainWindow : Window
 
         string jsCheckLocked = @"
             (function() {
-                // Chiến thuật: Kiểm tra icon ổ khóa trên sidebar (thanh bên trái).
-                // Item đang được chọn sẽ có aria-current='page' hoặc class 'active/selected'.
-                // Nếu item đó có icon ổ khoá (SVG lock) thì mới thật sự bị khoá.
+                // CHỈ kiểm tra 2 điều kiện chắc chắn:
                 
+                // Cách 1: Sidebar item đang active có aria-label chứa 'Locked'
                 var activeItem = document.querySelector('a[aria-current=""page""]') || 
-                                 document.querySelector('li[class*=""selected""] a') ||
-                                 document.querySelector('div[class*=""active""] a[href]');
+                                 document.querySelector('li[class*=""selected""] a');
                 
                 if (activeItem) {
-                    // Cách 1: Kiểm tra aria-label chứa chữ 'Locked'
                     var ariaLabel = (activeItem.getAttribute('aria-label') || '').toLowerCase();
                     if (ariaLabel.includes('locked')) {
                         return 'LOCKED';
                     }
-                    
-                    // Cách 2: Kiểm tra có SVG icon ổ khoá bên trong item
-                    var lockSvg = activeItem.querySelector('svg[aria-label*=""lock"" i], svg[data-testid*=""lock"" i], svg.lock-icon');
-                    if (lockSvg) {
-                        return 'LOCKED';
-                    }
-                    
-                    // Cách 3: Tìm icon lock qua title hoặc class
-                    var lockIcon = activeItem.querySelector('[title*=""lock"" i], [class*=""lock"" i], [aria-hidden] path');
-                    if (lockIcon) {
-                        // Kiểm tra SVG path đặc trưng của icon ổ khoá (hình chữ nhật + vòng cung)
-                        var paths = activeItem.querySelectorAll('path');
-                        for (var i = 0; i < paths.length; i++) {
-                            var d = paths[i].getAttribute('d') || '';
-                            // Icon lock thường có path chứa 'lock' hoặc các đường cong đặc trưng
-                            if (d.includes('M6') && d.includes('V6') && d.length > 30 && d.length < 200) {
-                                return 'LOCKED';
-                            }
-                        }
-                    }
                 }
                 
-                // Fallback cuối cùng: nếu không tìm được sidebar thì check nội dung trang
-                // nhưng CHỈ khi trang thật sự trắng trơn (không có nội dung bài học nào)
+                // Cách 2: Body text có chữ rõ ràng 'this item is locked'
+                // VÀ trang trắng trơn (không có nội dung quiz, video, bài đọc nào)
                 var bodyText = document.body.innerText.toLowerCase();
-                var mainContent = document.querySelector('.rc-LessonCollectionBody, .rc-SubmissionBody, .rc-PeerReviewBody, video, .rc-CML');
-                if (!mainContent && bodyText.includes('this item is locked')) {
+                var hasContent = document.querySelector('.rc-LessonCollectionBody, .rc-SubmissionBody, .rc-PeerReviewBody, video, .rc-CML, textarea, div[role=""radiogroup""], .rc-FormPartsQuestion, div[data-testid*=""part-""]');
+                if (!hasContent && bodyText.includes('this item is locked')) {
                     return 'LOCKED';
                 }
                 
@@ -776,11 +753,34 @@ public partial class MainWindow : Window
                 // Tìm chữ 'You passed!' trên trang
                 var hasPassed = bodyText.includes('You passed!');
                 
+                // Tìm chữ 'Your grade:' với điểm >= 80%
+                var gradeMatch = bodyText.match(/Your grade:\s*(\d+)%/);
+                if (gradeMatch && parseInt(gradeMatch[1]) >= 80) {
+                    hasPassed = true;
+                }
+                
+                // Tìm nút 'Next item' (dạng button xanh có chữ Next item)
+                var btns = Array.from(document.querySelectorAll('button, a'));
+                var hasNextItemBtn = btns.some(b => {
+                    var t = (b.innerText || '').trim().toLowerCase();
+                    return t.includes('next item');
+                });
+                if (hasNextItemBtn && !bodyText.includes('didn')) {
+                    hasPassed = true;
+                }
+                
                 // Tìm chữ 'You didn\'t pass' hoặc tương tự
                 var hasFailed = bodyText.includes('You didn') || bodyText.includes('not pass') || bodyText.includes('didn\'t pass');
                 
+                // Nếu vừa có pass vừa có fail text → ưu tiên pass (có thể đang xem feedback của bài đã pass)
+                if (hasPassed && hasFailed) {
+                    // Nếu có grade >= 80 thì chắc chắn pass
+                    if (gradeMatch && parseInt(gradeMatch[1]) >= 80) {
+                        hasFailed = false;
+                    }
+                }
+                
                 // Tìm nút Start/Resume/Retake (nghĩa là chưa vào làm bài)
-                var btns = Array.from(document.querySelectorAll('button, a'));
                 var hasStartBtn = btns.some(b => {
                     var t = (b.innerText || '').trim().toLowerCase();
                     return t === 'start assignment' || t === 'resume assignment';
@@ -800,7 +800,7 @@ public partial class MainWindow : Window
                 
                 if (hasPassed) {
                     return 'PASSED|hasNext=' + !!hasNextPrimary;
-                } else if (hasFailed || hasRetakeBtn) {
+                } else if (hasFailed) {
                     return 'FAILED|hasFeedback=' + hasFeedbackBtn + '|hasRetake=' + hasRetakeBtn;
                 } else if (hasStartBtn) {
                     return 'NEW';
@@ -1936,9 +1936,57 @@ public partial class MainWindow : Window
         ";
         await MainWebView.ExecuteScriptAsync(jsConfirm);
 
-        _viewModel.StatusText = "🏆 Đã nộp bài Tự luận! Đang chờ tải lại trang...";
-        await Task.Delay(4000);
-        MainWebView.Reload();
+        _viewModel.StatusText = "🏆 Đã nộp bài Tự luận! Đang chờ Coursera xử lý...";
+        
+        // Chờ Coursera xử lý submit (KHÔNG reload trang)
+        // Chỉ đợi DOM cập nhật và check sidebar có tick xanh chưa
+        for (int waitLoop = 0; waitLoop < 10; waitLoop++)
+        {
+            await Task.Delay(3000);
+            
+            // Check sidebar xem bài đã có tick xanh chưa
+            string jsCheckSidebar = @"
+                (function() {
+                    // Tìm item đang active trong sidebar
+                    var items = document.querySelectorAll('a[data-click-key*=""item_link""]');
+                    for (var i = 0; i < items.length; i++) {
+                        var html = items[i].innerHTML;
+                        if (items[i].getAttribute('aria-current') === 'page' || items[i].classList.contains('rc-ItemLink--active')) {
+                            if (html.includes('>Completed<')) {
+                                return 'COMPLETED';
+                            }
+                        }
+                    }
+                    
+                    // Cách 2: Check text trên body
+                    var bodyText = document.body.innerText;
+                    if (bodyText.includes('Grade: 100%') || bodyText.includes('Your grade') || bodyText.includes('Submission confirmed')) {
+                        return 'COMPLETED';
+                    }
+                    
+                    return 'WAITING';
+                })();
+            ";
+            
+            try
+            {
+                string sidebarResult = await MainWebView.ExecuteScriptAsync(jsCheckSidebar);
+                if (sidebarResult != null && sidebarResult.Contains("COMPLETED"))
+                {
+                    _viewModel.StatusText = "✅ Bài tự luận đã được chấp nhận! Tick xanh rồi!";
+                    await Task.Delay(1000);
+                    await CheckLessonCompletedAndClickNextAsync();
+                    return;
+                }
+            }
+            catch { }
+            
+            _viewModel.StatusText = $"⏳ Đang chờ Coursera xác nhận bài nộp... ({(waitLoop + 1) * 3}s)";
+        }
+        
+        // Nếu chờ 30s mà chưa thấy tick xanh → thử bấm Next
+        _viewModel.StatusText = "⏭️ Đã chờ đủ lâu. Thử chuyển bài...";
+        await CheckLessonCompletedAndClickNextAsync();
     }
 
     private bool _isHandlingPeerReview = false;
@@ -1953,18 +2001,30 @@ public partial class MainWindow : Window
             _viewModel.StatusText = "👀 Đang tự động chấm điểm cho bạn cùng lớp (Peer Review)...";
             await Task.Delay(3000);
             
+            int reviewCount = 0;
+            int maxReviews = 5; // Giới hạn tối đa, thường chỉ cần 3
             bool isAllDone = false;
-            while (!isAllDone)
+            
+            while (!isAllDone && reviewCount < maxReviews)
             {
                 await DismissAnyGlobalPopupsAsync();
 
-                // CHÚ Ý: Không dùng CheckLessonCompletedAndClickNextAsync ở đây, vì trang Peer Review
-                // luôn hiện nút Next màu xanh dù chưa chấm xong.
+                // CHECK SIDEBAR CÓ TICK XANH CHƯA (Hoàn thành = Dừng ngay)
                 string jsCheckCompleted = @"
                     (function() {
                         var bodyText = document.body.innerText.toLowerCase();
                         
-                        // Kiểm tra sidebar: lấy item đang được focus hiện tại
+                        // Cách 1: Check sidebar item đang active
+                        var items = document.querySelectorAll('a[data-click-key*=""item_link""]');
+                        for (var i = 0; i < items.length; i++) {
+                            if (items[i].getAttribute('aria-current') === 'page' || items[i].classList.contains('rc-ItemLink--active')) {
+                                if (items[i].innerHTML.includes('>Completed<')) {
+                                    return 'COMPLETED';
+                                }
+                            }
+                        }
+                        
+                        // Cách 2: Check active item trong sidebar bằng aria-label
                         var activeItem = document.querySelector('a[data-testid=""rc-WeekNavigationItem""][aria-current=""page""]');
                         var isSidebarCompleted = activeItem && activeItem.getAttribute('aria-label') && activeItem.getAttribute('aria-label').includes('Completed');
                         
@@ -1974,8 +2034,6 @@ public partial class MainWindow : Window
                             bodyText.includes(""you've finished your peer reviews"") ||
                             bodyText.includes(""you have finished your peer reviews"")) 
                         {
-                            var nextBtn = document.querySelector('button[aria-label=""Go to next item""]');
-                            if (nextBtn) { nextBtn.click(); }
                             return 'COMPLETED';
                         }
                         return 'NOT_YET';
@@ -1984,108 +2042,122 @@ public partial class MainWindow : Window
                 string checkResult = await MainWebView.ExecuteScriptAsync(jsCheckCompleted);
                 if (checkResult != null && checkResult.Contains("COMPLETED"))
                 {
-                    _viewModel.StatusText = "⏭️ Đã chấm xong đủ số lượng bài yêu cầu! Đang qua bài...";
+                    _viewModel.StatusText = "✅ Sidebar đã tick xanh! Đã chấm đủ số lượng bài yêu cầu!";
                     isAllDone = true;
+                    // Bấm Next để qua bài
+                    await CheckLessonCompletedAndClickNextAsync();
                     break;
                 }
 
                 // Bước 1: Bấm Start Reviewing
                 string jsStart = @"
-            (function() {
-                var btns = Array.from(document.querySelectorAll('button, a'));
-                var startBtn = btns.find(b => {
-                    var text = (b.innerText || b.textContent || '').trim().toLowerCase();
-                    return text === 'start reviewing' || text === 'review fellow learners';
-                });
-                if (startBtn && !startBtn.disabled) {
-                    startBtn.click();
-                    return 'CLICKED_START';
-                }
-                return 'NO_START';
-            })();
-        ";
-        string resultStart = await MainWebView.ExecuteScriptAsync(jsStart);
-        
-        if (resultStart != null && resultStart.Contains("CLICKED_START"))
-        {
-            _viewModel.StatusText = "👀 Đang mở bài của bạn cùng lớp...";
-            // Đợi chuyển sang trang review-next (React tự render không load lại trang)
-            await Task.Delay(4000); 
-        }
-
-        // Bước 2: Chấm điểm (Chọn max điểm) và điền lời khen
-        string jsGrade = @"
-            (function() {
-                var actionTaken = false;
-
-                // Chọn điểm cao nhất cho mỗi Rubric
-                var groups = document.querySelectorAll('div[role=""radiogroup""]');
-                groups.forEach(g => {
-                    var radios = g.querySelectorAll('input[type=""radio""]');
-                    if (radios.length > 0) {
-                        var targetRadio = radios[radios.length - 1];
-                        if (!targetRadio.checked) {
-                            targetRadio.click();
-                            actionTaken = true;
+                    (function() {
+                        var btns = Array.from(document.querySelectorAll('button, a'));
+                        var startBtn = btns.find(b => {
+                            var text = (b.innerText || b.textContent || '').trim().toLowerCase();
+                            return text === 'start reviewing' || text === 'review fellow learners';
+                        });
+                        if (startBtn && !startBtn.disabled) {
+                            startBtn.click();
+                            return 'CLICKED_START';
                         }
-                    }
-                });
+                        return 'NO_START';
+                    })();
+                ";
+                string resultStart = await MainWebView.ExecuteScriptAsync(jsStart);
+                
+                if (resultStart != null && resultStart.Contains("CLICKED_START"))
+                {
+                    _viewModel.StatusText = $"👀 Đang mở bài #{reviewCount + 1} của bạn cùng lớp...";
+                    await Task.Delay(4000); 
+                }
 
-                // Tìm và điền Textarea bằng tuyệt chiêu lừa React 16+
-                var textboxes = document.querySelectorAll('textarea');
-                for (var i = 0; i < textboxes.length; i++) {
-                    var tb = textboxes[i];
-                    if (!tb.value || tb.value.trim() === '') {
-                        var msg = 'Great job on this assignment! Your responses were well-thought-out and covered all the necessary points. Keep up the good work!';
-                        
-                        // React 16+ value tracker bypass
-                        let lastValue = tb.value;
-                        tb.value = msg;
-                        let event = new Event('input', { bubbles: true });
-                        event.simulated = true;
-                        let tracker = tb._valueTracker;
-                        if (tracker) {
-                            tracker.setValue(lastValue);
+                // Bước 2: Chấm điểm (Chọn max điểm) và điền lời khen
+                string jsGrade = @"
+                    (function() {
+                        var actionTaken = false;
+
+                        // Chọn điểm cao nhất cho mỗi Rubric
+                        var groups = document.querySelectorAll('div[role=""radiogroup""]');
+                        groups.forEach(g => {
+                            var radios = g.querySelectorAll('input[type=""radio""]');
+                            if (radios.length > 0) {
+                                var targetRadio = radios[radios.length - 1];
+                                if (!targetRadio.checked) {
+                                    targetRadio.click();
+                                    actionTaken = true;
+                                }
+                            }
+                        });
+
+                        // Tìm và điền Textarea bằng tuyệt chiêu lừa React 16+
+                        var textboxes = document.querySelectorAll('textarea');
+                        for (var i = 0; i < textboxes.length; i++) {
+                            var tb = textboxes[i];
+                            if (!tb.value || tb.value.trim() === '') {
+                                var msg = 'Great job on this assignment! Your responses were well-thought-out and covered all the necessary points. Keep up the good work!';
+                                
+                                let lastValue = tb.value;
+                                tb.value = msg;
+                                let event = new Event('input', { bubbles: true });
+                                event.simulated = true;
+                                let tracker = tb._valueTracker;
+                                if (tracker) {
+                                    tracker.setValue(lastValue);
+                                }
+                                tb.dispatchEvent(event);
+                                tb.dispatchEvent(new Event('change', { bubbles: true }));
+                                tb.dispatchEvent(new Event('blur', { bubbles: true }));
+                                
+                                actionTaken = true;
+                            }
                         }
-                        tb.dispatchEvent(event);
                         
-                        // Kích hoạt thêm change và blur cho chắc
-                        tb.dispatchEvent(new Event('change', { bubbles: true }));
-                        tb.dispatchEvent(new Event('blur', { bubbles: true }));
+                        var btns = Array.from(document.querySelectorAll('button'));
+                        var submitBtn = btns.find(b => {
+                            var text = (b.innerText || b.textContent || '').trim().toLowerCase();
+                            return text === 'submit review' || text === 'submit';
+                        });
+
+                        if (submitBtn && !submitBtn.disabled) {
+                            submitBtn.click();
+                            return 'SUBMITTED';
+                        }
                         
-                        actionTaken = true;
+                        return actionTaken ? 'GRADED' : 'NO_ACTION';
+                    })();
+                ";
+                string gradeResult = await MainWebView.ExecuteScriptAsync(jsGrade);
+                
+                if (gradeResult != null && gradeResult.Contains("SUBMITTED"))
+                {
+                    reviewCount++;
+                    _viewModel.StatusText = $"✅ Đã nộp phiếu #{reviewCount}! Chờ Coursera xử lý...";
+                    await Task.Delay(5000); // Chờ React render
+                    
+                    // SAU KHI SUBMIT: Check sidebar ngay lập tức
+                    string recheck = await MainWebView.ExecuteScriptAsync(jsCheckCompleted);
+                    if (recheck != null && recheck.Contains("COMPLETED"))
+                    {
+                        _viewModel.StatusText = $"✅ Đã chấm {reviewCount} bài, sidebar tick xanh rồi! Qua bài tiếp!";
+                        isAllDone = true;
+                        await CheckLessonCompletedAndClickNextAsync();
+                        break;
                     }
                 }
-                
-                // Đợi một chút rồi bấm Submit
-                var btns = Array.from(document.querySelectorAll('button'));
-                var submitBtn = btns.find(b => {
-                    var text = (b.innerText || b.textContent || '').trim().toLowerCase();
-                    return text === 'submit review' || text === 'submit';
-                });
-
-                if (submitBtn && !submitBtn.disabled) {
-                    submitBtn.click();
-                    return 'SUBMITTED';
+                else
+                {
+                    _viewModel.StatusText = "⏳ Đã điền xong nhưng nút Submit chưa bấm được. Chờ thêm...";
+                    await Task.Delay(2000);
                 }
-                
-                return actionTaken ? 'GRADED' : 'NO_ACTION';
-            })();
-        ";
-        string gradeResult = await MainWebView.ExecuteScriptAsync(jsGrade);
-        
-        if (gradeResult != null && gradeResult.Contains("SUBMITTED"))
-        {
-            _viewModel.StatusText = "✅ Đã nộp 1 phiếu! Chờ Coursera tự động chuyển sang bài tiếp theo...";
-            await Task.Delay(5000); // Chờ React render bài review tiếp theo
-            // Vòng lặp sẽ tự động quay lại kiểm tra và chấm tiếp!
-        }
-        else
-        {
-            _viewModel.StatusText = "⏳ Đã điền xong nhưng nút Submit chưa bấm được. Chờ thêm...";
-            await Task.Delay(2000);
-        }
             } // Kết thúc vòng lặp while
+            
+            // Nếu đã chấm max bài mà vẫn chưa tick xanh → dừng lại, thử bấm Next
+            if (!isAllDone)
+            {
+                _viewModel.StatusText = $"⚠️ Đã chấm {reviewCount}/{maxReviews} bài. Thử chuyển bài...";
+                await CheckLessonCompletedAndClickNextAsync();
+            }
 
         }
         finally
