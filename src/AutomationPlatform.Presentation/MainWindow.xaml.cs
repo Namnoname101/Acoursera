@@ -119,8 +119,7 @@ public partial class MainWindow : Window
             };
             var options = new Microsoft.Web.WebView2.Core.CoreWebView2EnvironmentOptions("--remote-debugging-port=9222");
             var env = await Microsoft.Web.WebView2.Core.CoreWebView2Environment.CreateAsync(null, null, options);
-            await MainWebView.EnsureCoreWebView2Async(env);
-            
+            await MainWebView.EnsureCoreWebView2Async(env);            
             // Tiêm cờ giả lập Lockdown Browser vào React Window object trước khi trang load
             await MainWebView.CoreWebView2.AddScriptToExecuteOnDocumentCreatedAsync(@"
                 Object.defineProperty(window, 'isLockdownBrowser', { get: () => true, set: () => {} });
