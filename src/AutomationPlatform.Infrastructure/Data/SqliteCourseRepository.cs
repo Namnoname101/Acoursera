@@ -1,6 +1,7 @@
 using Microsoft.Data.Sqlite;
 using AutomationPlatform.Domain.Entities;
 using AutomationPlatform.Domain.Interfaces;
+using System.IO;
 using System.Text.Json;
 
 namespace AutomationPlatform.Infrastructure.Data;
@@ -9,9 +10,25 @@ public sealed class SqliteCourseRepository : IRepository<CourseEntity, Guid>
 {
     private readonly string _connectionString;
 
-    public SqliteCourseRepository(string dbPath = "automation.db")
+    public SqliteCourseRepository(string? dbPath = null)
     {
-        _connectionString = $"Data Source={dbPath}";
+        string resolvedPath = string.IsNullOrWhiteSpace(dbPath)
+            ? Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "Acose",
+                "Data",
+                "automation.db")
+            : Path.GetFullPath(dbPath);
+        string? dataDirectory = Path.GetDirectoryName(resolvedPath);
+        if (!string.IsNullOrWhiteSpace(dataDirectory))
+        {
+            Directory.CreateDirectory(dataDirectory);
+        }
+
+        _connectionString = new SqliteConnectionStringBuilder
+        {
+            DataSource = resolvedPath
+        }.ToString();
         EnsureDatabaseCreated();
     }
 

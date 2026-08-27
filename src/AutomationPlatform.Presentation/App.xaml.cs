@@ -5,6 +5,7 @@ using AutomationPlatform.Application.Interfaces;
 using AutomationPlatform.Infrastructure.Browser;
 using AutomationPlatform.Infrastructure.Data;
 using AutomationPlatform.Domain.Interfaces;
+using AutomationPlatform.Presentation.Services;
 using AutomationPlatform.Presentation.ViewModels;
 
 namespace AutomationPlatform.Presentation;
@@ -16,6 +17,18 @@ public partial class App : System.Windows.Application
     protected override void OnStartup(StartupEventArgs e)
     {
         base.OnStartup(e);
+        WorkerLaunchOptions workerLaunchOptions;
+        try
+        {
+            workerLaunchOptions = WorkerLaunchOptions.FromArgs(e.Args);
+        }
+        catch (Exception exception)
+        {
+            MessageBox.Show(exception.Message, "ACOSE Worker", MessageBoxButton.OK, MessageBoxImage.Error);
+            Shutdown(2);
+            return;
+        }
+
         _host = Host.CreateDefaultBuilder(e.Args)
             .ConfigureServices((context, services) =>
             {
@@ -27,6 +40,13 @@ public partial class App : System.Windows.Application
 
                 // Đăng ký ViewModels
                 services.AddTransient<MainViewModel>();
+
+                // AgentRouter chạy qua Codex harness; lỗi/quota sẽ chuyển sang các HTTP provider.
+                services.AddSingleton<AiCompletionService>();
+
+                // Worker mode chỉ thêm lớp điều phối; logic automation trong MainWindow được giữ nguyên.
+                services.AddSingleton(workerLaunchOptions);
+                services.AddSingleton<CentralWorkerClient>();
 
                 // Đăng ký MainWindow (khởi tạo sau khi DI sẵn sàng)
                 services.AddSingleton<MainWindow>();
