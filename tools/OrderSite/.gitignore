@@ -1,0 +1,19 @@
+# Runtime and local files
+/node_modules/
+/.env*
+*.log
+/coverage/
+
+# Unused files left by the interrupted Sites scaffold. The Fly app uses only
+# server.js, public/, test/, Dockerfile, fly.toml and the package metadata.
+/.openai/
+/app/
+/components/
+/hooks/
+/lib/
+/.oxfmtrc.json
+/.oxlintrc.json
+/components.json
+/next.config.ts
+/tsconfig.json
+/vite.config.ts

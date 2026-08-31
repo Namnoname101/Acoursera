@@ -1,0 +1,287 @@
+<!doctype html>
+<html lang="vi">
+
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <meta name="theme-color" content="#12211b">
+  <meta name="description" content="Acosera V.I.P">
+  <meta property="og:title" content="Acosera V.I.P">
+  <meta property="og:description" content="Auto hoàn thành Coursera nhanh chóng và tốc độ.">
+  <meta property="og:type" content="website">
+  <meta property="og:image" content="https://acose-order-entry-20260831.fly.dev/og.png">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="Acosera V.I.P">
+  <meta name="twitter:description" content="Auto hoàn thành Coursera nhanh chóng và tốc độ.">
+  <meta name="twitter:image" content="https://acose-order-entry-20260831.fly.dev/og.png">
+  <title>Acosera V.I.P</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/styles.css">
+</head>
+
+<body>
+  <header class="site-header">
+    <a class="brand" href="/" aria-label="ACOSE Order Desk">
+      <span class="brand-mark" aria-hidden="true">AO</span>
+      <span class="brand-copy"><strong>ACOSE</strong><small>Order Desk</small></span>
+    </a>
+    <div class="header-actions">
+      <span id="connectionState" class="connection-state"><i></i><span>Đang kiểm tra</span></span>
+      <button id="changeKeyButton" class="button ghost compact" type="button">
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <path
+            d="M15 7a5 5 0 1 0-4.6 6.98L12 15.6V18h2v2h3v-3l2.55-2.55A5 5 0 0 0 15 7Zm0 3a2 2 0 1 1 0-4 2 2 0 0 1 0 4Z" />
+        </svg>
+        Đổi khóa
+      </button>
+    </div>
+  </header>
+
+  <main class="page-shell">
+    <section class="intro" aria-labelledby="pageTitle">
+      <div>
+        <p class="eyebrow">Bàn vận hành · Tạo đơn trực tiếp</p>
+        <h1 id="pageTitle">Lên đơn trong một màn hình.</h1>
+        <p>Chọn khóa học, nhập tài khoản Google và theo dõi xác minh ngay bên cạnh.</p>
+      </div>
+      <div class="intro-note"><span>01</span>
+        <p>Đơn chỉ được tạo sau khi Coursera xác nhận đăng nhập thành công.</p>
+      </div>
+    </section>
+
+    <div class="primary-grid">
+      <section class="panel order-panel" aria-labelledby="orderFormTitle">
+        <div class="panel-heading">
+          <div>
+            <p class="step-label">Bước 1 · Thông tin đơn</p>
+            <h2 id="orderFormTitle">Tạo phiên lên đơn</h2>
+          </div>
+          <span id="selectionCount" class="count-pill">0 khóa</span>
+        </div>
+
+        <form id="orderForm" autocomplete="off">
+          <fieldset id="orderFields">
+            <label class="field full">
+              <span>Tên khách <small>không bắt buộc</small></span>
+              <input id="customerName" name="customerName" type="text" maxlength="200"
+                placeholder="Ví dụ: Anh Nam · Python" autocomplete="off">
+            </label>
+
+            <div class="course-block full">
+              <div class="field-heading">
+                <div><strong>Khóa học đã lưu</strong><small>Có thể chọn nhiều khóa</small></div>
+                <label class="course-search">
+                  <span class="sr-only">Tìm khóa học</span>
+                  <svg viewBox="0 0 24 24" aria-hidden="true">
+                    <circle cx="11" cy="11" r="7" />
+                    <path d="m20 20-3.5-3.5" />
+                  </svg>
+                  <input id="courseSearch" type="search" placeholder="Tìm theo tên hoặc slug" autocomplete="off">
+                </label>
+              </div>
+              <div id="courseList" class="course-list" aria-live="polite">
+                <div class="loading-row"><span></span>
+                  <p>Đang tải danh sách khóa học…</p>
+                </div>
+              </div>
+            </div>
+
+            <label class="field full">
+              <span>Thêm bằng URL <small>mỗi dòng một link</small></span>
+              <textarea id="courseUrls" name="courseUrls" rows="3" spellcheck="false"
+                placeholder="https://www.coursera.org/.../ten-khoa-hoc"></textarea>
+              <small class="field-help">Nhận mọi link khóa học HTTPS trên Coursera, không bắt buộc dạng /learn · tối đa
+                20 khóa.</small>
+            </label>
+
+            <div class="skip-group full">
+              <div><strong>Dạng bài cần bỏ qua</strong><small>Worker vẫn tiếp tục sang bài tiếp theo</small></div>
+              <label class="switch-row">
+                <input id="skipGraded" type="checkbox" checked>
+                <span class="switch" aria-hidden="true"></span>
+                <span><strong>Graded App</strong><small>Ứng dụng chấm điểm bên ngoài</small></span>
+              </label>
+              <label class="switch-row">
+                <input id="skipPractice" type="checkbox" checked>
+                <span class="switch" aria-hidden="true"></span>
+                <span><strong>Practice App</strong><small>Ứng dụng thực hành bên ngoài</small></span>
+              </label>
+            </div>
+
+            <label class="field">
+              <span>Tài khoản Google</span>
+              <input id="googleEmail" name="googleEmail" type="email" maxlength="320" inputmode="email"
+                autocapitalize="none" spellcheck="false" autocomplete="off" placeholder="ten@gmail.com" required>
+            </label>
+            <label class="field">
+              <span>Mật khẩu Google</span>
+              <span class="password-wrap">
+                <input id="googlePassword" name="googlePassword" type="password" maxlength="1024" autocomplete="off"
+                  spellcheck="false" placeholder="••••••••" required>
+                <button id="togglePassword" type="button" class="password-toggle"
+                  aria-label="Hiện mật khẩu">Hiện</button>
+              </span>
+            </label>
+
+            <div class="security-note full">
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M12 3 5 6v5c0 4.6 2.8 8.8 7 10 4.2-1.2 7-5.4 7-10V6l-7-3Z" />
+                <path d="m9 12 2 2 4-4" />
+              </svg>
+              <div><strong>Dữ liệu dùng một lần</strong><span>Mật khẩu bị xóa khỏi form ngay khi gửi, không lưu trên
+                  site này và không xuất hiện trong nhật ký.</span></div>
+            </div>
+          </fieldset>
+
+          <p id="formError" class="form-message" role="alert"></p>
+          <button id="submitOrder" class="button primary submit-button" type="submit">
+            <span>Đăng nhập &amp; tạo đơn</span>
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M5 12h14m-6-6 6 6-6 6" />
+            </svg>
+          </button>
+        </form>
+      </section>
+
+      <aside class="panel status-panel" aria-labelledby="statusTitle">
+        <div class="panel-heading status-heading">
+          <div>
+            <p class="step-label">Bước 2 · Theo dõi trực tiếp</p>
+            <h2 id="statusTitle">Trạng thái phiên</h2>
+          </div>
+          <span id="liveBadge" class="live-badge" hidden><i></i> Live</span>
+        </div>
+
+        <div id="emptyStatus" class="empty-status">
+          <div class="radar" aria-hidden="true"><span></span><i></i></div>
+          <h3>Chưa có phiên đang chạy</h3>
+          <p>Sau khi gửi đơn, tiến trình đăng nhập và số xác minh sẽ xuất hiện tại đây.</p>
+        </div>
+
+        <div id="activeStatus" class="active-status" hidden>
+          <div class="status-summary">
+            <span id="statusIcon" class="status-icon"></span>
+            <div>
+              <p id="statusCode">Đang xử lý</p>
+              <h3 id="statusHeading">Đã tiếp nhận yêu cầu</h3><span id="statusDescription"></span>
+            </div>
+          </div>
+
+          <ol id="statusTimeline" class="timeline">
+            <li data-stage="1"><span>1</span>
+              <div><strong>Tiếp nhận</strong><small>Giữ thông tin tạm thời</small></div>
+            </li>
+            <li data-stage="2"><span>2</span>
+              <div><strong>Đăng nhập Google</strong><small>Worker mở trình duyệt riêng</small></div>
+            </li>
+            <li data-stage="3"><span>3</span>
+              <div><strong>Xác minh</strong><small>Khách xác nhận trên điện thoại</small></div>
+            </li>
+            <li data-stage="4"><span>4</span>
+              <div><strong>Tạo đơn</strong><small>Xếp khóa học vào hàng đợi</small></div>
+            </li>
+          </ol>
+
+          <section id="challengeCard" class="challenge-card" hidden aria-live="assertive">
+            <span id="challengeLabel">Số khách cần chọn</span>
+            <strong id="challengeValue">—</strong>
+            <p id="challengeHelp">Báo khách chọn đúng số này trên điện thoại. Không yêu cầu OTP hoặc mật khẩu.</p>
+          </section>
+
+          <section id="resultCard" class="result-card" hidden>
+            <div><span>Đơn đã tạo</span><strong id="resultOrders">—</strong></div>
+            <div><span>Khách hàng</span><strong id="resultCustomer">—</strong></div>
+            <div><span>Khóa học</span><strong id="resultCourses">—</strong></div>
+            <div><span>Tiến độ</span><strong id="resultJob">Theo dõi bên dưới</strong></div>
+          </section>
+
+          <div class="activity-card">
+            <span>Máy chủ đang báo</span>
+            <strong id="activityText">Đang cập nhật…</strong>
+            <small id="activityMeta">Vừa xong</small>
+          </div>
+
+          <div class="status-actions">
+            <button id="viewLiveOrdersButton" class="button secondary" type="button" hidden>Xem tiến độ</button>
+            <button id="newOrderButton" class="button secondary" type="button" hidden>Lên đơn mới</button>
+            <button id="cancelAttemptButton" class="button danger" type="button">Hủy đăng nhập</button>
+          </div>
+        </div>
+      </aside>
+    </div>
+
+    <section id="liveOrdersPanel" class="panel live-orders-panel" aria-labelledby="liveOrdersTitle">
+      <div class="panel-heading live-orders-heading">
+        <div>
+          <p class="step-label">Sau khi tạo đơn · Cập nhật tự động</p>
+          <h2 id="liveOrdersTitle" tabindex="-1">Tiến độ đơn</h2>
+        </div>
+        <div class="live-orders-actions">
+          <span id="jobsLiveBadge" class="live-badge"><i></i><span>Cập nhật 5 giây</span></span>
+          <button id="refreshLiveOrders" class="button ghost compact" type="button">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M20 11a8 8 0 1 0 2 5m0-5v-6m0 6h-6" />
+            </svg>
+            Làm mới
+          </button>
+        </div>
+      </div>
+
+      <div id="liveOrderSummary" class="live-order-summary" role="status" aria-live="polite" aria-atomic="true">
+        <div data-tone="active"><span>Đang chạy</span><strong id="liveRunningCount">0</strong></div>
+        <div data-tone="queued"><span>Đang chờ</span><strong id="liveQueuedCount">0</strong></div>
+        <div data-tone="attention"><span>Cần xử lý</span><strong id="liveAttentionCount">0</strong></div>
+        <div data-tone="finished"><span>Đã kết thúc</span><strong id="liveFinishedCount">0</strong></div>
+      </div>
+
+      <p id="liveOrdersNotice" class="live-orders-notice" role="status" aria-live="polite" hidden></p>
+      <div id="liveOrdersList" class="live-orders-list" aria-busy="true">
+        <div class="loading-row"><span></span>
+          <p>Đang tải tiến độ các đơn…</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel recent-panel" aria-labelledby="recentTitle">
+      <div class="panel-heading">
+        <div>
+          <p class="step-label">Phiên tạm thời</p>
+          <h2 id="recentTitle">Phiên đăng nhập gần đây</h2>
+        </div>
+        <button id="refreshAttempts" class="button ghost compact" type="button">
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M20 11a8 8 0 1 0 2 5m0-5v-6m0 6h-6" />
+          </svg>
+          Làm mới
+        </button>
+      </div>
+      <div id="recentAttempts" class="recent-attempts">
+        <div class="loading-row"><span></span>
+          <p>Đang tải các phiên gần đây…</p>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <dialog id="authDialog" class="auth-dialog">
+    <form id="authForm" method="dialog">
+      <div class="dialog-brand"><span class="brand-mark">AO</span>
+        <div><strong>Kết nối Order Desk</strong><small>Phiên quản trị riêng tư</small></div>
+      </div>
+      <h2>Nhập Admin API key</h2>
+      <p>Khóa chỉ được giữ trong tab này để xác thực các thao tác lên đơn.</p>
+      <label class="field">
+        <span>Admin API key</span>
+        <input id="adminKeyInput" type="password" autocomplete="current-password" required autofocus>
+      </label>
+      <p id="authError" class="form-message" role="alert"></p>
+      <button id="connectButton" class="button primary full-button" type="submit">Kết nối máy chủ</button>
+    </form>
+  </dialog>
+
+  <div id="toastRegion" class="toast-region" aria-live="polite"></div>
+  <script src="/app.js" defer></script>
+</body>
+
+</html>

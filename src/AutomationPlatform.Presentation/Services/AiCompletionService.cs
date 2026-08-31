@@ -1,11 +1,9 @@
 using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
-using System.Net;
-using System.Net.Http;
-using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 
 namespace AutomationPlatform.Presentation.Services;
 
@@ -25,16 +23,26 @@ public sealed record AiCompletionResult(
 public sealed class AiCompletionService
 {
     private static readonly TimeSpan CodexTimeout = TimeSpan.FromSeconds(120);
+    private static readonly TimeSpan AgentRouterRequestTimeout = TimeSpan.FromSeconds(150);
+    private static readonly TimeSpan CodexReaderDrainTimeout = TimeSpan.FromSeconds(5);
+    private static readonly TimeSpan[] AgentRouterRetryDelays =
+    {
+        TimeSpan.FromSeconds(1),
+        TimeSpan.FromSeconds(3)
+    };
+    private static readonly SemaphoreSlim AgentRouterRequestGate = new(1, 1);
+    private static readonly Regex TerminalAnsiSequence = new(
+        @"\x1B\[[0-?]*[ -/]*[@-~]",
+        RegexOptions.Compiled);
+    private static readonly Regex SensitiveDiagnosticValue = new(
+        """(?i)(['"]?(?:api[_-]?key|authorization|token|password|secret)['"]?\s*[:=]\s*)(?:"(?:\\.|[^"])*"|'(?:\\.|[^'])*'|[^\s,;}\]]+)""",
+        RegexOptions.Compiled);
+    private static readonly Regex BearerDiagnosticValue = new(
+        """(?i)\bbearer\s+(?:"(?:\\.|[^"])*"|'(?:\\.|[^'])*'|[^\s,;}\]]+)""",
+        RegexOptions.Compiled);
+    private const int MaxAgentRouterAttempts = 3;
     private const int MaxCodexStandardOutputChars = 2_000_000;
     private const int MaxCodexStandardErrorChars = 256_000;
-
-    private static readonly HttpClient HttpClient = new()
-    {
-        Timeout = TimeSpan.FromSeconds(60)
-    };
-
-    private readonly HashSet<string> _disabledProviders = new(StringComparer.OrdinalIgnoreCase);
-    private readonly object _disabledProvidersLock = new();
 
     public async Task<AiCompletionResult> CompleteAsync(
         string systemPrompt,
@@ -43,131 +51,104 @@ public sealed class AiCompletionService
         IProgress<string>? progress = null,
         CancellationToken cancellationToken = default)
     {
-        var providers = GetConfiguredProviders();
-        if (providers.Count == 0)
+        _ = temperature;
+
+        var provider = GetConfiguredAgentRouter();
+        if (provider is null)
         {
             return AiCompletionResult.Failed(
-                "Chưa cấu hình khóa AI. Hãy đặt AGENTROUTER_API_KEY, GROQ_API_KEY " +
-                "hoặc GEMINI_API_KEY (DEEPSEEK_API_KEY là tùy chọn) rồi thử lại.");
+                "Chưa cấu hình AgentRouter. Hãy đặt AGENTROUTER_API_KEY rồi thử lại.");
         }
 
-        var failures = new List<string>();
-        for (var index = 0; index < providers.Count; index++)
+        var gateAcquired = false;
+        ProviderAttemptResult? finalAttempt = null;
+        using var requestTimeoutSource = new CancellationTokenSource(AgentRouterRequestTimeout);
+        using var requestCancellationSource = CancellationTokenSource.CreateLinkedTokenSource(
+            cancellationToken,
+            requestTimeoutSource.Token);
+        var requestCancellationToken = requestCancellationSource.Token;
+        try
         {
-            var provider = providers[index];
-            if (IsDisabled(provider.Name))
+            if (AgentRouterRequestGate.CurrentCount == 0)
             {
-                failures.Add($"{provider.Name}: đã tạm vô hiệu trong phiên này");
-                continue;
+                progress?.Report("🤖 AgentRouter đang xử lý yêu cầu trước; đang chờ lượt...");
             }
 
-            progress?.Report($"🤖 Đang hỏi {provider.Name}...");
-            var attempt = provider.Transport == AiProviderTransport.CodexCli
-                ? await TryCompleteWithCodexAsync(
+            await AgentRouterRequestGate.WaitAsync(requestCancellationToken);
+            gateAcquired = true;
+
+            for (var attemptNumber = 1; attemptNumber <= MaxAgentRouterAttempts; attemptNumber++)
+            {
+                progress?.Report(attemptNumber == 1
+                    ? $"🤖 Đang hỏi AgentRouter ({provider.Model})..."
+                    : $"🤖 AgentRouter đang thử lại lần {attemptNumber}/{MaxAgentRouterAttempts}...");
+
+                finalAttempt = await TryCompleteWithCodexAsync(
                     provider,
                     systemPrompt,
                     userPrompt,
-                    cancellationToken)
-                : await TryCompleteWithOpenAiHttpAsync(
-                    provider,
-                    systemPrompt,
-                    userPrompt,
-                    temperature,
-                    cancellationToken);
+                    requestCancellationToken);
+                if (finalAttempt.Success)
+                {
+                    return AiCompletionResult.Succeeded(finalAttempt.Content, provider.Name);
+                }
 
-            if (attempt.Success)
-            {
-                return AiCompletionResult.Succeeded(attempt.Content, provider.Name);
+                if (attemptNumber == MaxAgentRouterAttempts ||
+                    !ShouldRetryAgentRouterAttempt(finalAttempt))
+                {
+                    break;
+                }
+
+                await Task.Delay(
+                    AgentRouterRetryDelays[attemptNumber - 1],
+                    requestCancellationToken);
             }
-
-            failures.Add($"{provider.Name}: {attempt.UserMessage}");
-            if (attempt.DisableForSession)
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested &&
+                                                 requestTimeoutSource.IsCancellationRequested)
+        {
+            return AiCompletionResult.Failed(
+                "AgentRouter quá thời gian chờ; vui lòng thử lại sau ít phút.");
+        }
+        finally
+        {
+            if (gateAcquired)
             {
-                Disable(provider.Name);
-            }
-
-            var nextProvider = providers
-                .Skip(index + 1)
-                .FirstOrDefault(candidate => !IsDisabled(candidate.Name));
-            if (nextProvider is not null)
-            {
-                progress?.Report(
-                    $"⚠️ {provider.Name} hết quota hoặc gặp lỗi; đang chuyển sang {nextProvider.Name}...");
+                AgentRouterRequestGate.Release();
             }
         }
 
         return AiCompletionResult.Failed(
-            "Không provider AI nào trả lời được. " + string.Join("; ", failures));
+            $"AgentRouter: {finalAttempt?.UserMessage ?? "không nhận được kết quả"}");
     }
 
-    private static List<AiProvider> GetConfiguredProviders()
+    private static bool ShouldRetryAgentRouterAttempt(ProviderAttemptResult attempt)
     {
-        var providers = new List<AiProvider>();
+        if (attempt.DisableForSession)
+        {
+            return false;
+        }
 
-        AddProviderIfConfigured(
-            providers,
-            name: "AgentRouter",
-            apiUrl: "https://agentrouter.org/v1",
-            model: GetEnvironmentValue("AGENTROUTER_MODEL") ?? "gpt-5.6-sol",
-            apiKey: GetEnvironmentValue("AGENTROUTER_API_KEY"),
-            supportsTemperature: false,
-            disableThinking: false,
-            transport: AiProviderTransport.CodexCli,
-            executablePath: ResolveCodexExecutablePath());
-
-        AddProviderIfConfigured(
-            providers,
-            name: "DeepSeek",
-            apiUrl: "https://api.deepseek.com/chat/completions",
-            model: GetEnvironmentValue("DEEPSEEK_MODEL") ?? "deepseek-v4-flash",
-            apiKey: GetEnvironmentValue("DEEPSEEK_API_KEY"),
-            supportsTemperature: true,
-            disableThinking: true);
-
-        AddProviderIfConfigured(
-            providers,
-            name: "Groq Free",
-            apiUrl: "https://api.groq.com/openai/v1/chat/completions",
-            model: GetEnvironmentValue("GROQ_MODEL") ?? "openai/gpt-oss-120b",
-            apiKey: GetEnvironmentValue("GROQ_API_KEY"),
-            supportsTemperature: true,
-            disableThinking: false);
-
-        AddProviderIfConfigured(
-            providers,
-            name: "Gemini Free",
-            apiUrl: "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
-            model: GetEnvironmentValue("GEMINI_MODEL") ?? "gemini-3.7-flash",
-            apiKey: GetEnvironmentValue("GEMINI_API_KEY") ?? GetEnvironmentValue("GOOGLE_API_KEY"),
-            supportsTemperature: false,
-            disableThinking: false);
-
-        return providers;
+        return !attempt.UserMessage.Contains("vượt giới hạn", StringComparison.OrdinalIgnoreCase) &&
+            !attempt.UserMessage.Contains("từ chối nội dung yêu cầu", StringComparison.OrdinalIgnoreCase);
     }
 
-    private static void AddProviderIfConfigured(
-        ICollection<AiProvider> providers,
-        string name,
-        string apiUrl,
-        string model,
-        string? apiKey,
-        bool supportsTemperature,
-        bool disableThinking,
-        AiProviderTransport transport = AiProviderTransport.OpenAiChatCompletions,
-        string? executablePath = null)
+    private static AiProvider? GetConfiguredAgentRouter()
     {
+        var apiKey = GetEnvironmentValue("AGENTROUTER_API_KEY");
         if (!string.IsNullOrWhiteSpace(apiKey))
         {
-            providers.Add(new AiProvider(
-                name,
-                apiUrl,
-                model,
+            return new AiProvider(
+                "AgentRouter",
+                "https://agentrouter.org/v1",
+                // The former gpt-5.6-sol pool is exhausted. This model was
+                // verified through the same AgentRouter key and endpoint.
+                GetEnvironmentValue("AGENTROUTER_MODEL") ?? "deepseek-v4-flash",
                 apiKey,
-                supportsTemperature,
-                disableThinking,
-                transport,
-                executablePath));
+                ResolveCodexExecutablePath());
         }
+
+        return null;
     }
 
     private static string? GetEnvironmentValue(string name)
@@ -217,7 +198,13 @@ public sealed class AiCompletionService
         try
         {
             var fullPath = Path.GetFullPath(executablePath);
-            return File.Exists(fullPath) ? fullPath : null;
+            return File.Exists(fullPath) &&
+                   string.Equals(
+                       Path.GetFileName(fullPath),
+                       "codex.exe",
+                       StringComparison.OrdinalIgnoreCase)
+                ? fullPath
+                : null;
         }
         catch (Exception exception) when (exception is ArgumentException
             or NotSupportedException
@@ -290,8 +277,26 @@ public sealed class AiCompletionService
 
             await process.WaitForExitAsync(linkedSource.Token);
 
-            var standardOutput = await standardOutputTask;
-            var standardError = await standardErrorTask;
+            // A descendant can keep an inherited pipe handle open after the CLI
+            // exits.  Never await the stream readers indefinitely in that case;
+            // the finally block below will perform bounded cleanup instead.
+            var standardOutputResultTask = ReadWithDeadlineAsync(
+                standardOutputTask,
+                cancellationToken);
+            var standardErrorResultTask = ReadWithDeadlineAsync(
+                standardErrorTask,
+                cancellationToken);
+            var standardOutputResult = await standardOutputResultTask;
+            var standardErrorResult = await standardErrorResultTask;
+            if (!standardOutputResult.Completed || !standardErrorResult.Completed)
+            {
+                return ProviderAttemptResult.Failed(
+                    "Codex CLI không đóng luồng phản hồi đúng hạn",
+                    disableForSession: true);
+            }
+
+            var standardOutput = standardOutputResult.Content;
+            var standardError = standardErrorResult.Content;
             if (process.ExitCode != 0)
             {
                 return CreateCodexFailure(process.ExitCode, standardOutput, standardError);
@@ -357,7 +362,13 @@ public sealed class AiCompletionService
             CreateNoWindow = true,
             RedirectStandardInput = true,
             RedirectStandardOutput = true,
-            RedirectStandardError = true
+            RedirectStandardError = true,
+            // Codex reads the '-' prompt strictly as UTF-8.  The Windows ANSI
+            // code page can corrupt Vietnamese text (and other Unicode content)
+            // before it reaches the child process, causing "invalid UTF-8".
+            StandardInputEncoding = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false),
+            StandardOutputEncoding = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false),
+            StandardErrorEncoding = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false)
         };
 
         AddCodexArgument(startInfo, "exec");
@@ -377,8 +388,10 @@ public sealed class AiCompletionService
         AddCodexConfig(startInfo, $"model_providers.agentrouter.base_url=\"{provider.ApiUrl}\"");
         AddCodexConfig(startInfo, "model_providers.agentrouter.env_key=\"AGENTROUTER_API_KEY\"");
         AddCodexConfig(startInfo, "model_providers.agentrouter.wire_api=\"responses\"");
-        AddCodexConfig(startInfo, "model_providers.agentrouter.request_max_retries=0");
-        AddCodexConfig(startInfo, "model_providers.agentrouter.stream_max_retries=0");
+        // Let the Codex transport absorb one short upstream glitch.  The outer
+        // attempt loop below provides the final bounded retry if the child exits.
+        AddCodexConfig(startInfo, "model_providers.agentrouter.request_max_retries=1");
+        AddCodexConfig(startInfo, "model_providers.agentrouter.stream_max_retries=1");
         AddCodexConfig(startInfo, "features.apps=false");
         AddCodexConfig(startInfo, "features.auth_elicitation=false");
         AddCodexConfig(startInfo, "features.browser_use=false");
@@ -477,6 +490,21 @@ public sealed class AiCompletionService
         return result.ToString();
     }
 
+    private static async Task<(bool Completed, string Content)> ReadWithDeadlineAsync(
+        Task<string> readTask,
+        CancellationToken cancellationToken)
+    {
+        var deadlineTask = Task.Delay(CodexReaderDrainTimeout, cancellationToken);
+        var completedTask = await Task.WhenAny(readTask, deadlineTask);
+        if (completedTask == readTask)
+        {
+            return (true, await readTask);
+        }
+
+        cancellationToken.ThrowIfCancellationRequested();
+        return (false, string.Empty);
+    }
+
     private static string BuildCodexPrompt(string systemPrompt, string userPrompt)
     {
         return $$"""
@@ -543,6 +571,8 @@ public sealed class AiCompletionService
         string standardError)
     {
         var diagnostics = $"{standardOutput}\n{standardError}";
+        var detail = ExtractStructuredCodexFailureDetail(standardOutput, standardError)
+            ?? ExtractSafePlainTextDiagnostic(standardError);
         if (diagnostics.Contains("401", StringComparison.OrdinalIgnoreCase)
             || diagnostics.Contains("unauthorized", StringComparison.OrdinalIgnoreCase)
             || diagnostics.Contains("unauthenticated", StringComparison.OrdinalIgnoreCase))
@@ -562,9 +592,155 @@ public sealed class AiCompletionService
                 disableForSession: true);
         }
 
+        if (diagnostics.Contains("context_length", StringComparison.OrdinalIgnoreCase)
+            || diagnostics.Contains("too long", StringComparison.OrdinalIgnoreCase)
+            || diagnostics.Contains("maximum context", StringComparison.OrdinalIgnoreCase))
+        {
+            return ProviderAttemptResult.Failed(
+                "yêu cầu vượt giới hạn nội dung của AgentRouter",
+                disableForSession: false);
+        }
+
+        if (diagnostics.Contains("content-blocked", StringComparison.OrdinalIgnoreCase))
+        {
+            return ProviderAttemptResult.Failed(
+                "AgentRouter từ chối nội dung yêu cầu; không thử lại tự động",
+                disableForSession: false);
+        }
+
+        if (!string.IsNullOrWhiteSpace(detail))
+        {
+            return ProviderAttemptResult.Failed(
+                $"AgentRouter báo: {detail}",
+                disableForSession: false);
+        }
+
         return ProviderAttemptResult.Failed(
-            $"Codex CLI kết thúc với mã lỗi {exitCode}",
+            $"Codex CLI kết thúc với mã lỗi {exitCode} (không có chẩn đoán an toàn)",
             disableForSession: false);
+    }
+
+    private static string? ExtractStructuredCodexFailureDetail(
+        params string[] diagnosticStreams)
+    {
+        string? lastDetail = null;
+        foreach (var diagnosticStream in diagnosticStreams)
+        {
+            using var reader = new StringReader(diagnosticStream);
+            while (reader.ReadLine() is { } line)
+            {
+                if (string.IsNullOrWhiteSpace(line))
+                {
+                    continue;
+                }
+
+                try
+                {
+                    using var document = JsonDocument.Parse(line);
+                    var root = document.RootElement;
+                    if (root.ValueKind != JsonValueKind.Object)
+                    {
+                        continue;
+                    }
+
+                    var type = root.TryGetProperty("type", out var typeElement)
+                        && typeElement.ValueKind == JsonValueKind.String
+                        ? typeElement.GetString()
+                        : null;
+                    if (string.Equals(type, "turn.failed", StringComparison.OrdinalIgnoreCase)
+                        || string.Equals(type, "error", StringComparison.OrdinalIgnoreCase))
+                    {
+                        lastDetail = ReadCodexErrorMessage(root) ?? lastDetail;
+                    }
+
+                    if (root.TryGetProperty("item", out var item)
+                        && item.ValueKind == JsonValueKind.Object
+                        && item.TryGetProperty("type", out var itemType)
+                        && itemType.ValueKind == JsonValueKind.String
+                        && string.Equals(itemType.GetString(), "error", StringComparison.OrdinalIgnoreCase))
+                    {
+                        lastDetail = ReadCodexErrorMessage(item) ?? lastDetail;
+                    }
+                }
+                catch (JsonException)
+                {
+                    // Only structured Codex events are safe to surface to the UI.
+                }
+            }
+        }
+
+        return lastDetail;
+    }
+
+    private static string? ReadCodexErrorMessage(JsonElement element)
+    {
+        string? message = null;
+        if (element.TryGetProperty("message", out var messageElement)
+            && messageElement.ValueKind == JsonValueKind.String)
+        {
+            message = messageElement.GetString();
+        }
+        else if (element.TryGetProperty("error", out var errorElement))
+        {
+            message = errorElement.ValueKind == JsonValueKind.String
+                ? errorElement.GetString()
+                : errorElement.ValueKind == JsonValueKind.Object
+                  && errorElement.TryGetProperty("message", out var nestedMessage)
+                  && nestedMessage.ValueKind == JsonValueKind.String
+                    ? nestedMessage.GetString()
+                    : null;
+        }
+
+        if (string.IsNullOrWhiteSpace(message))
+        {
+            return null;
+        }
+
+        return RedactDiagnostic(message);
+    }
+
+    private static string? ExtractSafePlainTextDiagnostic(string standardError)
+    {
+        string? lastErrorLine = null;
+        using var reader = new StringReader(standardError);
+        while (reader.ReadLine() is { } line)
+        {
+            var normalized = NormalizeDiagnosticLine(line);
+            if (string.IsNullOrWhiteSpace(normalized) || !LooksLikeCodexError(normalized))
+            {
+                continue;
+            }
+
+            lastErrorLine = RedactDiagnostic(normalized);
+        }
+
+        return lastErrorLine;
+    }
+
+    private static bool LooksLikeCodexError(string line) =>
+        line.StartsWith("error", StringComparison.OrdinalIgnoreCase) ||
+        line.StartsWith("fatal", StringComparison.OrdinalIgnoreCase) ||
+        line.StartsWith("failed", StringComparison.OrdinalIgnoreCase) ||
+        line.Contains("unauthorized", StringComparison.OrdinalIgnoreCase) ||
+        line.Contains("forbidden", StringComparison.OrdinalIgnoreCase) ||
+        line.Contains("timeout", StringComparison.OrdinalIgnoreCase) ||
+        line.Contains("connection", StringComparison.OrdinalIgnoreCase) ||
+        line.Contains("http ", StringComparison.OrdinalIgnoreCase) ||
+        line.Contains("unexpected argument", StringComparison.OrdinalIgnoreCase) ||
+        line.Contains("invalid value", StringComparison.OrdinalIgnoreCase) ||
+        line.Contains("not found", StringComparison.OrdinalIgnoreCase);
+
+    private static string NormalizeDiagnosticLine(string line) => string.Join(
+        " ",
+        TerminalAnsiSequence.Replace(line, string.Empty)
+            .Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries));
+
+    private static string RedactDiagnostic(string diagnostic)
+    {
+        var normalized = NormalizeDiagnosticLine(diagnostic);
+        var redacted = BearerDiagnosticValue.Replace(normalized, "Bearer [REDACTED]");
+        redacted = SensitiveDiagnosticValue.Replace(redacted, "$1[REDACTED]");
+        return redacted.Length <= 280 ? redacted : redacted[..280] + "…";
     }
 
     private static async Task StopAndDrainProcessAsync(
@@ -664,142 +840,14 @@ public sealed class AiCompletionService
         }
     }
 
-    private static async Task<ProviderAttemptResult> TryCompleteWithOpenAiHttpAsync(
-        AiProvider provider,
-        string systemPrompt,
-        string userPrompt,
-        double temperature,
-        CancellationToken cancellationToken)
-    {
-        var requestBody = new Dictionary<string, object?>
-        {
-            ["model"] = provider.Model,
-            ["messages"] = new[]
-            {
-                new { role = "system", content = systemPrompt },
-                new { role = "user", content = userPrompt }
-            }
-        };
-
-        if (provider.SupportsTemperature)
-        {
-            requestBody["temperature"] = temperature;
-        }
-
-        if (provider.DisableThinking)
-        {
-            requestBody["thinking"] = new { type = "disabled" };
-        }
-
-        try
-        {
-            using var request = new HttpRequestMessage(HttpMethod.Post, provider.ApiUrl);
-            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", provider.ApiKey);
-            request.Content = new StringContent(
-                JsonSerializer.Serialize(requestBody),
-                Encoding.UTF8,
-                "application/json");
-
-            using var response = await HttpClient.SendAsync(request, cancellationToken);
-            if (!response.IsSuccessStatusCode)
-            {
-                return CreateHttpFailure(response.StatusCode);
-            }
-
-            var responseJson = await response.Content.ReadAsStringAsync(cancellationToken);
-            using var jsonDocument = JsonDocument.Parse(responseJson);
-            if (!jsonDocument.RootElement.TryGetProperty("choices", out var choices)
-                || choices.ValueKind != JsonValueKind.Array
-                || choices.GetArrayLength() == 0
-                || !choices[0].TryGetProperty("message", out var message)
-                || !message.TryGetProperty("content", out var contentElement))
-            {
-                return ProviderAttemptResult.Failed(
-                    "phản hồi không đúng định dạng",
-                    disableForSession: false);
-            }
-
-            var content = contentElement.GetString()?.Trim();
-            if (string.IsNullOrWhiteSpace(content))
-            {
-                return ProviderAttemptResult.Failed(
-                    "phản hồi rỗng",
-                    disableForSession: false);
-            }
-
-            return ProviderAttemptResult.Succeeded(content);
-        }
-        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
-        {
-            return ProviderAttemptResult.Failed("quá thời gian chờ", disableForSession: false);
-        }
-        catch (HttpRequestException)
-        {
-            return ProviderAttemptResult.Failed("lỗi kết nối", disableForSession: false);
-        }
-        catch (JsonException)
-        {
-            return ProviderAttemptResult.Failed("phản hồi JSON không hợp lệ", disableForSession: false);
-        }
-        catch (Exception)
-        {
-            return ProviderAttemptResult.Failed("lỗi không xác định", disableForSession: false);
-        }
-    }
-
-    private static ProviderAttemptResult CreateHttpFailure(HttpStatusCode statusCode)
-    {
-        var code = (int)statusCode;
-        return statusCode switch
-        {
-            HttpStatusCode.PaymentRequired => ProviderAttemptResult.Failed(
-                "hết số dư (HTTP 402)", disableForSession: true),
-            HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden => ProviderAttemptResult.Failed(
-                $"khóa API không hợp lệ hoặc không có quyền (HTTP {code})", disableForSession: true),
-            HttpStatusCode.TooManyRequests => ProviderAttemptResult.Failed(
-                "đã chạm giới hạn miễn phí (HTTP 429)", disableForSession: true),
-            HttpStatusCode.RequestTimeout => ProviderAttemptResult.Failed(
-                "provider quá thời gian chờ (HTTP 408)", disableForSession: false),
-            _ when code >= 500 => ProviderAttemptResult.Failed(
-                $"dịch vụ tạm lỗi (HTTP {code})", disableForSession: false),
-            _ => ProviderAttemptResult.Failed(
-                $"yêu cầu bị từ chối (HTTP {code})", disableForSession: false)
-        };
-    }
-
-    private bool IsDisabled(string providerName)
-    {
-        lock (_disabledProvidersLock)
-        {
-            return _disabledProviders.Contains(providerName);
-        }
-    }
-
-    private void Disable(string providerName)
-    {
-        lock (_disabledProvidersLock)
-        {
-            _disabledProviders.Add(providerName);
-        }
-    }
-
     private sealed record AiProvider(
         string Name,
         string ApiUrl,
         string Model,
         string ApiKey,
-        bool SupportsTemperature,
-        bool DisableThinking,
-        AiProviderTransport Transport,
         string? ExecutablePath)
     {
         public override string ToString() => $"{Name} ({Model})";
-    }
-
-    private enum AiProviderTransport
-    {
-        OpenAiChatCompletions,
-        CodexCli
     }
 
     private sealed record ProviderAttemptResult(

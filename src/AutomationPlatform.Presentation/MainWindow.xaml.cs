@@ -38,6 +38,30 @@ public partial class MainWindow : Window
         int CurrentModule,
         int TotalModules);
 
+    private sealed record CourseLandingProbe(
+        string State,
+        string? Href,
+        string? Label);
+
+    private sealed record QuizAnswerResolution(
+        bool Success,
+        List<List<string>>? Answers,
+        string ProviderName,
+        string Message,
+        bool IsAiFailure)
+    {
+        public static QuizAnswerResolution Completed(
+            List<List<string>> answers,
+            string providerName) =>
+            new(true, answers, providerName, string.Empty, false);
+
+        public static QuizAnswerResolution ValidationFailed(string message) =>
+            new(false, null, string.Empty, message, false);
+
+        public static QuizAnswerResolution AiFailed(string message) =>
+            new(false, null, string.Empty, message, true);
+    }
+
     private readonly MainViewModel _viewModel;
     private readonly AiCompletionService _aiCompletionService;
     private readonly WorkerLaunchOptions _workerLaunchOptions;
@@ -62,8 +86,36 @@ public partial class MainWindow : Window
     private System.Windows.Threading.DispatcherTimer? _workerHeartbeatTimer;
     private CourseProgressSnapshot? _lastCourseProgressSnapshot;
     private bool _courseHasSkippedLaunchAppItems;
+    // Coursera can label the same activity as "Ungraded App Item" in the
+    // outline and "Practice App Item" on the activity page. Keep the exact
+    // paths that were deliberately skipped so a later outline scan cannot
+    // reopen them when labels or DOM structure differ.
+    private readonly HashSet<string> _skippedLaunchAppItemPaths =
+        new(StringComparer.OrdinalIgnoreCase);
+    // A module that contains only completed or configured-to-skip activities
+    // is complete for this automation run even if Coursera keeps its own
+    // module badge at Incomplete.
+    private readonly HashSet<int> _automationCompletedModuleNumbers = [];
+    private bool _isScanningCourseOutline;
+    private bool _courseHasSkippedPeerItems;
+    // An assessment can be accepted by Coursera while its grade is still
+    // pending.  Keep the canonical lesson paths for the current course job so
+    // the course scanner does not reopen the same accepted submission.
+    private readonly HashSet<string> _pendingGradedResultPaths =
+        new(StringComparer.OrdinalIgnoreCase);
+    private bool _courseHasPendingGradedResults;
+    // A discussion can be visibly submitted before Coursera adds the sidebar
+    // completion icon. Keep its canonical path out of the scanner if it has no
+    // usable Next control, otherwise the course home sweep would reopen it.
+    private readonly HashSet<string> _submittedDiscussionPaths =
+        new(StringComparer.OrdinalIgnoreCase);
+    private bool _courseHasSubmittedDiscussionItems;
+    private bool _isHandlingCourseLanding;
     private bool _courseJobCompletionReported;
+    private bool _coursePauseInProgress;
+    private int _courseLandingFallbackCount;
     private bool _workerClosing;
+    private bool _workerClaimPending;
     private CancellationTokenSource? _directLoginLifetime;
     private bool _directLoginActive;
     private bool _directLoginTerminal;
@@ -71,16 +123,29 @@ public partial class MainWindow : Window
     private string? _directLoginChallengeNumber;
     private bool _directLoginStatusDirty;
     private readonly System.Threading.SemaphoreSlim _directLoginPopupLock = new(1, 1);
-    private Microsoft.Web.WebView2.Core.CoreWebView2Controller? _directLoginOAuthController;
+    private Window? _directLoginOAuthWindow;
+    private Microsoft.Web.WebView2.Wpf.WebView2? _directLoginOAuthBrowser;
     private Microsoft.Web.WebView2.Core.CoreWebView2? _directLoginOAuthWebView;
     private Uri? _directLoginOAuthExpectedRedirectUri;
     private string? _directLoginOAuthFailure;
+    private TaskCompletionSource<bool>? _directLoginOAuthPopupOpened;
+    private static readonly TimeSpan DirectLoginWebViewOperationTimeout = TimeSpan.FromSeconds(5);
 
     private bool ShouldSkipGradedAppItems =>
         _centralWorkerClient.CurrentJob?.SkipGradedAppItems ?? true;
 
     private bool ShouldSkipPracticeAppItems =>
         _centralWorkerClient.CurrentJob?.SkipPracticeAppItems ?? true;
+
+    private bool IsInteractiveBrowseSession => string.Equals(
+        _centralWorkerClient.CurrentJob?.Mode,
+        "browse",
+        StringComparison.OrdinalIgnoreCase);
+
+    // Peer-graded submissions and reviews must be completed by the learner.
+    // Treat them as an explicit, visible skip so the worker can keep processing
+    // the remaining supported lessons in the course.
+    private const bool ShouldSkipPeerItems = true;
 
     public MainWindow(
         MainViewModel viewModel,
@@ -93,15 +158,22 @@ public partial class MainWindow : Window
         _aiCompletionService = aiCompletionService;
         _workerLaunchOptions = workerLaunchOptions;
         _centralWorkerClient = centralWorkerClient;
+        _workerClaimPending = _workerLaunchOptions.IsInteractiveProfile;
         DataContext = _viewModel;
 
-        if (_workerLaunchOptions.IsDirectLogin)
+        if (_workerLaunchOptions.IsDirectLogin || _workerLaunchOptions.IsInteractiveProfile)
         {
-            ShowInTaskbar = false;
-            ShowActivated = false;
-            WindowStartupLocation = WindowStartupLocation.Manual;
-            Left = -32000;
-            Top = -32000;
+            // Direct-login and manual profile sessions are intentionally visible
+            // on the Worker Host. Course automation continues to run hidden.
+            ShowInTaskbar = true;
+            ShowActivated = true;
+            WindowStartupLocation = WindowStartupLocation.CenterScreen;
+            WindowStyle = WindowStyle.SingleBorderWindow;
+            ResizeMode = _workerLaunchOptions.IsInteractiveProfile
+                ? ResizeMode.CanResize
+                : ResizeMode.CanMinimize;
+            Width = 1280;
+            Height = 900;
         }
 
         MainWebView.NavigationCompleted += MainWebView_NavigationCompleted;
@@ -109,6 +181,7 @@ public partial class MainWindow : Window
         MainWebView.SourceChanged += MainWebView_SourceChanged;
 
         this.Loaded += MainWindow_Loaded;
+        this.Closing += MainWindow_Closing;
         this.Closed += MainWindow_Closed;
     }
 
@@ -120,44 +193,69 @@ public partial class MainWindow : Window
             // Ta dùng DevTools Protocol để ép cứng Viewport logic luôn là 1920px.
             MainWebView.SizeChanged += async (s, args) =>
             {
-                if (MainWebView.CoreWebView2 == null) return;
-                
-                double targetWidth = 1920.0;
-                double actualWidth = MainWebView.ActualWidth;
-                double actualHeight = MainWebView.ActualHeight;
-
-                if (actualWidth > 0 && actualHeight > 0)
+                if (!_workerLaunchOptions.IsCourseAutomation)
                 {
-                    double scale = actualWidth < targetWidth ? actualWidth / targetWidth : 1.0;
-                    int virtualHeight = (int)(actualHeight / scale);
-
-                    string payload = $@"{{
-                        ""width"": 1920,
-                        ""height"": {virtualHeight},
-                        ""deviceScaleFactor"": 1,
-                        ""mobile"": false,
-                        ""scale"": {scale.ToString(System.Globalization.CultureInfo.InvariantCulture)}
-                    }}";
-
-                    try
-                    {
-                        await MainWebView.CoreWebView2.CallDevToolsProtocolMethodAsync("Emulation.setDeviceMetricsOverride", payload);
-                    }
-                    catch { }
+                    return;
                 }
+
+                try
+                {
+                    if (MainWebView.CoreWebView2 == null) return;
+
+                    double targetWidth = 1920.0;
+                    double actualWidth = MainWebView.ActualWidth;
+                    double actualHeight = MainWebView.ActualHeight;
+
+                    if (actualWidth > 0 && actualHeight > 0)
+                    {
+                        double scale = actualWidth < targetWidth ? actualWidth / targetWidth : 1.0;
+                        int virtualHeight = (int)(actualHeight / scale);
+
+                        string payload = $@"{{
+                            ""width"": 1920,
+                            ""height"": {virtualHeight},
+                            ""deviceScaleFactor"": 1,
+                            ""mobile"": false,
+                            ""scale"": {scale.ToString(System.Globalization.CultureInfo.InvariantCulture)}
+                        }}";
+
+                        try
+                        {
+                            await MainWebView.CoreWebView2.CallDevToolsProtocolMethodAsync("Emulation.setDeviceMetricsOverride", payload);
+                        }
+                        catch { }
+                    }
+                }
+                catch { }
             };
 
             // Cài đặt User-Agent chuyên dụng đã vượt qua bài test Lockdown Browser
             MainWebView.CoreWebView2InitializationCompleted += async (s, args) => {
                 if (args.IsSuccess) {
-                    if (!_workerLaunchOptions.IsDirectLogin)
+                    if (_workerLaunchOptions.IsCourseAutomation)
                     {
                         MainWebView.CoreWebView2.Settings.UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 coursera-locking-browser/0.6.5";
                     }
-                    else
+                    else if (_workerLaunchOptions.IsDirectLogin)
                     {
                         // Google rejects the old lockdown-browser UA. Keep the current WebView2 UA
                         // and prevent any credential/autofill persistence in this temporary profile.
+                        MainWebView.CoreWebView2.Settings.IsPasswordAutosaveEnabled = false;
+                        MainWebView.CoreWebView2.Settings.IsGeneralAutofillEnabled = false;
+                        MainWebView.CoreWebView2.ProcessFailed += (_, _) =>
+                        {
+                            if (_directLoginActive && !_directLoginTerminal)
+                            {
+                                _directLoginOAuthFailure =
+                                    "Trình duyệt đăng nhập Google đã dừng đột ngột. Vui lòng thử lại.";
+                                _directLoginOAuthPopupOpened?.TrySetResult(false);
+                            }
+                        };
+                    }
+                    else if (_workerLaunchOptions.IsInteractiveProfile)
+                    {
+                        // Keep the durable Coursera session/profile, but never
+                        // persist credentials entered during a manual repair.
                         MainWebView.CoreWebView2.Settings.IsPasswordAutosaveEnabled = false;
                         MainWebView.CoreWebView2.Settings.IsGeneralAutofillEnabled = false;
                     }
@@ -185,25 +283,28 @@ public partial class MainWindow : Window
                      * - Kết quả: Sidebar luôn hiển thị đầy đủ, không bao giờ bị chuyển sang chế độ Mobile.
                      * ========================================================================================= */
                     
-                    // Gọi ngay 1 lần lúc vừa khởi tạo xong để không cần chờ resize
-                    double targetWidth = 1920.0;
-                    double actualWidth = MainWebView.ActualWidth;
-                    double actualHeight = MainWebView.ActualHeight;
-
-                    if (actualWidth > 0 && actualHeight > 0)
+                    if (_workerLaunchOptions.IsCourseAutomation)
                     {
-                        double scale = actualWidth < targetWidth ? actualWidth / targetWidth : 1.0;
-                        int virtualHeight = (int)(actualHeight / scale);
+                        // Gọi ngay 1 lần lúc vừa khởi tạo xong để không cần chờ resize
+                        double targetWidth = 1920.0;
+                        double actualWidth = MainWebView.ActualWidth;
+                        double actualHeight = MainWebView.ActualHeight;
 
-                        string payload = $@"{{
-                            ""width"": 1920,
-                            ""height"": {virtualHeight},
-                            ""deviceScaleFactor"": 1,
-                            ""mobile"": false,
-                            ""scale"": {scale.ToString(System.Globalization.CultureInfo.InvariantCulture)}
-                        }}";
+                        if (actualWidth > 0 && actualHeight > 0)
+                        {
+                            double scale = actualWidth < targetWidth ? actualWidth / targetWidth : 1.0;
+                            int virtualHeight = (int)(actualHeight / scale);
 
-                        try { await MainWebView.CoreWebView2.CallDevToolsProtocolMethodAsync("Emulation.setDeviceMetricsOverride", payload); } catch { }
+                            string payload = $@"{{
+                                ""width"": 1920,
+                                ""height"": {virtualHeight},
+                                ""deviceScaleFactor"": 1,
+                                ""mobile"": false,
+                                ""scale"": {scale.ToString(System.Globalization.CultureInfo.InvariantCulture)}
+                            }}";
+
+                            try { await MainWebView.CoreWebView2.CallDevToolsProtocolMethodAsync("Emulation.setDeviceMetricsOverride", payload); } catch { }
+                        }
                     }
                 }
             };
@@ -219,7 +320,7 @@ public partial class MainWindow : Window
             var env = await Microsoft.Web.WebView2.Core.CoreWebView2Environment.CreateAsync(
                 null, workerProfilePath, options);
             await MainWebView.EnsureCoreWebView2Async(env);            
-            if (!_workerLaunchOptions.IsDirectLogin)
+            if (_workerLaunchOptions.IsCourseAutomation)
             {
                 // Chỉ course worker mới giả lập Lockdown Browser. Không tiêm script lạ vào
                 // accounts.google.com trong phiên đăng nhập trực tiếp.
@@ -239,6 +340,11 @@ public partial class MainWindow : Window
         {
             if (_workerLaunchOptions.Enabled)
             {
+                // WebView/environment setup can fail before a browse worker has
+                // a chance to claim its job. Do not leave the visible window in
+                // the claim-pending state, where its close guard would otherwise
+                // reject every attempt to exit.
+                _workerClaimPending = false;
                 _viewModel.StatusText = _workerLaunchOptions.IsDirectLogin
                     ? "❌ Không khởi tạo được trình đăng nhập tạm."
                     : "❌ Không khởi tạo được worker: " + exception.Message;
@@ -263,15 +369,68 @@ public partial class MainWindow : Window
                 await Task.Delay(250);
                 Close();
             }
+            else if (_workerLaunchOptions.IsInteractiveProfile &&
+                     _centralWorkerClient.CurrentJob == null)
+            {
+                _workerClosing = true;
+                await Task.Delay(250);
+                Close();
+            }
         }
 
     }
 
+    private void MainWindow_Closing(object? sender, System.ComponentModel.CancelEventArgs e)
+    {
+        if (_workerLaunchOptions.IsInteractiveProfile &&
+            _workerClaimPending &&
+            !_workerClosing &&
+            _centralWorkerClient.CurrentJob == null)
+        {
+            e.Cancel = true;
+            _viewModel.StatusText = "⏳ Đang nhận profile từ trung tâm; vui lòng chờ một lát rồi đóng lại.";
+            return;
+        }
+
+        // A course worker owns a claimed job until it reports a terminal result.
+        // Do not let an accidental Alt+F4/title-bar close turn a healthy job into
+        // "Worker window was closed by the operator". Intentional terminal paths
+        // set _workerClosing before calling Close(), and direct-login windows stay
+        // fully user-controllable for Google verification.
+        if (!_workerLaunchOptions.Enabled ||
+            _workerLaunchOptions.IsDirectLogin ||
+            _workerClosing ||
+            _centralWorkerClient.CurrentJob == null ||
+            string.Equals(
+                _centralWorkerClient.CurrentJob.Mode,
+                "browse",
+                StringComparison.OrdinalIgnoreCase))
+        {
+            return;
+        }
+
+        e.Cancel = true;
+        _viewModel.StatusText =
+            "⚠️ Worker đang xử lý job; yêu cầu đóng cửa sổ đã được bỏ qua.";
+    }
+
     private void MainWindow_Closed(object? sender, EventArgs e)
     {
+        // Preserve why the window closed before marking it as closed.  Several
+        // normal terminal paths set _workerClosing and call Close() after they
+        // have already reported a result to the central server.  Those paths
+        // must never be overwritten below as an operator-closed failure.
+        bool wasExpectedWorkerClose = _workerClosing;
+        WorkerJob? unexpectedlyClosedCourseJob =
+            _workerLaunchOptions.Enabled &&
+            !_workerLaunchOptions.IsDirectLogin &&
+            !wasExpectedWorkerClose
+                ? _centralWorkerClient.CurrentJob
+                : null;
+
         _workerClosing = true;
         _directLoginLifetime?.Cancel();
-        CloseDirectLoginOAuthController();
+        CloseDirectLoginOAuthWindow();
         if (_workerHeartbeatTimer != null)
         {
             _workerHeartbeatTimer.Stop();
@@ -294,7 +453,8 @@ public partial class MainWindow : Window
 
         if (_workerLaunchOptions.IsDirectLogin &&
             _centralWorkerClient.CurrentDirectLoginAttempt != null &&
-            !_directLoginTerminal)
+            !_directLoginTerminal &&
+            !wasExpectedWorkerClose)
         {
             using var closeTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(3));
             try
@@ -309,13 +469,13 @@ public partial class MainWindow : Window
             }
             catch { }
         }
-        else if (_workerLaunchOptions.Enabled && _centralWorkerClient.CurrentJob != null)
+        else if (unexpectedlyClosedCourseJob != null)
         {
             using var closeTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(3));
             try
             {
                 if (string.Equals(
-                    _centralWorkerClient.CurrentJob.Mode,
+                    unexpectedlyClosedCourseJob.Mode,
                     "browse",
                     StringComparison.OrdinalIgnoreCase))
                 {
@@ -347,15 +507,56 @@ public partial class MainWindow : Window
         try
         {
             WorkerJob job = await _centralWorkerClient.ClaimAsync();
+            _workerClaimPending = false;
+            bool isInteractiveProfile = string.Equals(
+                job.Mode,
+                "browse",
+                StringComparison.OrdinalIgnoreCase);
+            if (isInteractiveProfile != _workerLaunchOptions.IsInteractiveProfile)
+            {
+                throw new InvalidOperationException("Worker job mode does not match its launch request.");
+            }
             _courseHasSkippedLaunchAppItems = false;
+            _skippedLaunchAppItemPaths.Clear();
+            _automationCompletedModuleNumbers.Clear();
+            _isScanningCourseOutline = false;
+            _courseHasSkippedPeerItems = false;
+            _courseHasPendingGradedResults = false;
+            _pendingGradedResultPaths.Clear();
+            _courseHasSubmittedDiscussionItems = false;
+            _submittedDiscussionPaths.Clear();
             _courseJobCompletionReported = false;
-            SessionLease lease = await _centralWorkerClient.LeaseSessionAsync();
-            await ImportCourseraCookiesAsync(lease.Cookies);
+            _coursePauseInProgress = false;
+            _courseLandingFallbackCount = 0;
+            // A manually repaired durable profile is the freshest source of
+            // truth. Import the encrypted vault lease only when this device's
+            // local profile has no usable Coursera authentication cookie.
+            bool isUsingLocalProfileSession =
+                await HasValidCourseraAuthCookieAsync();
+            if (!isUsingLocalProfileSession && !isInteractiveProfile)
+            {
+                SessionLease lease = await _centralWorkerClient.LeaseSessionAsync();
+                await ImportCourseraCookiesAsync(lease.Cookies);
+            }
+            else if (!isUsingLocalProfileSession)
+            {
+                // A new/expired local profile can still be recovered from the
+                // encrypted vault. Manual browse remains available even when
+                // that lease has expired so the operator can sign in again.
+                try
+                {
+                    SessionLease lease = await _centralWorkerClient.LeaseSessionAsync();
+                    await ImportCourseraCookiesAsync(lease.Cookies);
+                }
+                catch { }
+            }
             await _centralWorkerClient.HeartbeatAsync(
                 "running",
-                job.Mode == "browse"
-                    ? "Đã mở phiên thao tác tài khoản"
-                    : "Đã nạp phiên khách; đang mở khóa học",
+                isInteractiveProfile
+                    ? "Đã mở profile riêng để thao tác tài khoản"
+                    : (isUsingLocalProfileSession
+                        ? "Đang dùng phiên mới nhất trong profile riêng"
+                        : "Đã khôi phục phiên khách; đang mở khóa học"),
                 job.Progress,
                 job.CurrentModule,
                 job.TotalModules);
@@ -371,15 +572,47 @@ public partial class MainWindow : Window
             UrlTextBox.Text = string.IsNullOrWhiteSpace(job.TargetUrl)
                 ? "https://www.coursera.org/"
                 : job.TargetUrl;
-            _viewModel.StatusText = "✅ Đã nạp đúng phiên khách; đang mở link...";
-            OnTestClick(this, new RoutedEventArgs());
+            if (isInteractiveProfile)
+            {
+                Title = string.IsNullOrWhiteSpace(job.CourseraUserName)
+                    ? "ACOSE · Profile Coursera"
+                    : $"ACOSE · {job.CourseraUserName}";
+                _viewModel.StatusText = "👤 Profile riêng đang mở để thao tác thủ công.";
+                Show();
+                Activate();
+                MainWebView.Source = new Uri(UrlTextBox.Text, UriKind.Absolute);
+            }
+            else
+            {
+                _viewModel.StatusText = isUsingLocalProfileSession
+                    ? "✅ Đang dùng phiên mới nhất trong profile riêng; đang mở khóa học..."
+                    : "✅ Đã khôi phục đúng phiên khách; đang mở khóa học...";
+                OnTestClick(this, new RoutedEventArgs());
+            }
         }
         catch (Exception exception)
         {
+            _workerClaimPending = false;
             _viewModel.StatusText = "❌ Không khởi động được worker: " + exception.Message;
+            var startupFailureReported = false;
             if (_centralWorkerClient.CurrentJob != null)
             {
-                try { await _centralWorkerClient.FailAsync("Worker startup failed."); } catch { }
+                try
+                {
+                    await _centralWorkerClient.FailAsync("Worker startup failed.");
+                    startupFailureReported = true;
+                }
+                catch { }
+            }
+
+            // Once the terminal startup failure reached the server, close the
+            // worker deliberately.  Otherwise the closing guard correctly keeps
+            // the window open for a recoverable report retry.
+            if (startupFailureReported)
+            {
+                _workerClosing = true;
+                await Task.Delay(350);
+                Close();
             }
         }
     }
@@ -465,7 +698,7 @@ public partial class MainWindow : Window
                 "Google đã xác nhận; đang kiểm tra phiên Coursera.",
                 cancellationToken: cancellationToken);
 
-            CloseDirectLoginOAuthController();
+            CloseDirectLoginOAuthWindow();
             MainWebView.CoreWebView2.Navigate("https://www.coursera.org/account-settings");
             await Task.Delay(TimeSpan.FromSeconds(2), cancellationToken);
             await EnsureCourseraIdentityAsync(maxAttempts: 12, forceRefresh: true);
@@ -523,7 +756,7 @@ public partial class MainWindow : Window
         finally
         {
             _directLoginActive = false;
-            CloseDirectLoginOAuthController();
+            CloseDirectLoginOAuthWindow();
             try
             {
                 if (MainWebView.CoreWebView2?.Profile != null)
@@ -596,12 +829,32 @@ public partial class MainWindow : Window
         DateTimeOffset lastRemoteCheck = DateTimeOffset.MinValue;
         DateTimeOffset? challengePageSeenAt = null;
         DateTimeOffset? oauthClickAt = null;
+        DateTimeOffset? oauthButtonWaitStartedAt = null;
+        DateTimeOffset? courseraReturnAt = null;
+        DateTimeOffset? lastCourseraLoginClickAt = null;
         bool oauthClickIssued = false;
-        bool googlePageSeen = false;
+        bool googleNavigationObserved = false;
+        bool googlePageReady = false;
+        bool googlePageLoadingReported = false;
+        int courseraLoginRecoveryCount = 0;
 
         while (DateTimeOffset.UtcNow < deadline)
         {
             cancellationToken.ThrowIfCancellationRequested();
+
+            // Always evaluate the OAuth hand-off timeout before touching WebView2
+            // state. A stalled cookie query must never leave the direct-login UI at
+            // "waiting for Google" until the overall 15-minute attempt expires.
+            if (oauthClickIssued && oauthClickAt.HasValue && !googlePageReady &&
+                DateTimeOffset.UtcNow - oauthClickAt.Value > TimeSpan.FromSeconds(30))
+            {
+                return new DirectLoginOutcome(
+                    DirectLoginOutcomeKind.Failed,
+                    googleNavigationObserved ? "GOOGLE_PAGE_NOT_READY" : "GOOGLE_OAUTH_NOT_OPENED",
+                    googleNavigationObserved
+                        ? "Google đã mở nhưng không tải được biểu mẫu đăng nhập."
+                        : "Coursera không mở được trang đăng nhập Google.");
+            }
 
             if (passwordSubmitted && !credentialsAcknowledged &&
                 DateTimeOffset.UtcNow - lastCredentialAckAttempt >= TimeSpan.FromSeconds(3))
@@ -621,7 +874,18 @@ public partial class MainWindow : Window
                     _directLoginOAuthFailure);
             }
 
-            if (await HasValidCourseraAuthCookieAsync())
+            Microsoft.Web.WebView2.Core.CoreWebView2 activeWebView = GetDirectLoginWebView();
+            Uri? currentUri = Uri.TryCreate(activeWebView.Source, UriKind.Absolute, out Uri? parsedUri)
+                ? parsedUri
+                : null;
+            string host = currentUri?.Host ?? string.Empty;
+            // The direct profile starts empty, so a cookie probe before Google has
+            // returned cannot possibly succeed. More importantly, WebView2 can hold
+            // GetCookiesAsync while it attaches a popup. Probe only after a Google
+            // navigation has actually happened and the browser is back on Coursera.
+            if ((passwordSubmitted || googleNavigationObserved) &&
+                IsHostOrSubdomain(host, "coursera.org") &&
+                await HasValidCourseraAuthCookieAsync(cancellationToken))
             {
                 if (passwordSubmitted && !credentialsAcknowledged)
                 {
@@ -638,6 +902,19 @@ public partial class MainWindow : Window
                     DirectLoginOutcomeKind.Success,
                     "OK",
                     "Đăng nhập Coursera thành công.");
+            }
+
+            if (oauthClickIssued && googleNavigationObserved &&
+                IsHostOrSubdomain(host, "coursera.org"))
+            {
+                courseraReturnAt ??= DateTimeOffset.UtcNow;
+                if (DateTimeOffset.UtcNow - courseraReturnAt.Value > TimeSpan.FromSeconds(45))
+                {
+                    return new DirectLoginOutcome(
+                        DirectLoginOutcomeKind.Failed,
+                        "COURSERA_SESSION_NOT_READY",
+                        "Google đã quay lại Coursera nhưng phiên đăng nhập chưa sẵn sàng.");
+                }
             }
 
             if (DateTimeOffset.UtcNow - lastRemoteCheck >= TimeSpan.FromSeconds(3))
@@ -668,37 +945,145 @@ public partial class MainWindow : Window
                 }
             }
 
-            Microsoft.Web.WebView2.Core.CoreWebView2 activeWebView = GetDirectLoginWebView();
-            Uri? currentUri = Uri.TryCreate(activeWebView.Source, UriKind.Absolute, out Uri? parsedUri)
-                ? parsedUri
-                : null;
-            string host = currentUri?.Host ?? string.Empty;
             if (IsHostOrSubdomain(host, "coursera.org"))
             {
-                if (!oauthClickIssued)
+                bool isMainCourseraView = ReferenceEquals(activeWebView, MainWebView.CoreWebView2);
+                if (isMainCourseraView &&
+                    (!lastCourseraLoginClickAt.HasValue ||
+                     DateTimeOffset.UtcNow - lastCourseraLoginClickAt.Value > TimeSpan.FromSeconds(3)))
                 {
-                    string clickResult = DecodeWebViewString(
-                        await activeWebView.ExecuteScriptAsync(ClickCourseraGoogleButtonScript));
-                    if (clickResult == "CLICKED")
+                    string loginResult = await ClickDirectLoginControlAsync(
+                        activeWebView,
+                        ClickCourseraLoginButtonScript,
+                        cancellationToken);
+                    if (loginResult == "LOGIN_CLICKED")
                     {
-                        oauthClickIssued = true;
-                        oauthClickAt = DateTimeOffset.UtcNow;
+                        lastCourseraLoginClickAt = DateTimeOffset.UtcNow;
+                        if (oauthClickIssued && ++courseraLoginRecoveryCount > 3)
+                        {
+                            return new DirectLoginOutcome(
+                                DirectLoginOutcomeKind.Failed,
+                                "GOOGLE_OAUTH_RETURNED_TO_COURSERA",
+                                "Google liên tục quay lại Coursera khi chưa đăng nhập.");
+                        }
+
+                        // Coursera can return to its public course page after an
+                        // OAuth popup is dismissed or redirected. Open its login
+                        // dialog again, then perform a fresh Google click instead
+                        // of waiting on the previous OAuth attempt.
+                        oauthClickIssued = false;
+                        oauthClickAt = null;
+                        oauthButtonWaitStartedAt = DateTimeOffset.UtcNow;
+                        googleNavigationObserved = false;
+                        googlePageReady = false;
+                        googlePageLoadingReported = false;
+                        courseraReturnAt = null;
                         await SetDirectLoginStatusAsync(
                             "signing_in",
-                            "Đã chọn đăng nhập bằng Google; đang chờ trang Google.",
+                            "Coursera đang ở trang chưa đăng nhập; đang mở lại đăng nhập Google.",
                             cancellationToken: cancellationToken);
+                        await Task.Delay(900, cancellationToken);
+                        continue;
+                    }
+                }
+
+                if (!oauthClickIssued)
+                {
+                    oauthButtonWaitStartedAt ??= DateTimeOffset.UtcNow;
+                    var popupOpened = new TaskCompletionSource<bool>(
+                        TaskCreationOptions.RunContinuationsAsynchronously);
+                    _directLoginOAuthPopupOpened = popupOpened;
+                    string clickResult = await ClickDirectLoginControlAsync(
+                        activeWebView,
+                        ClickCourseraGoogleButtonScript,
+                        cancellationToken);
+                    if (clickResult == "CLICKED")
+                    {
+                        Task completed = await Task.WhenAny(
+                            popupOpened.Task,
+                            Task.Delay(TimeSpan.FromSeconds(5), cancellationToken));
+                        bool popupWasOpened = completed == popupOpened.Task &&
+                                              await popupOpened.Task;
+                        Uri? mainUri = Uri.TryCreate(
+                            MainWebView.CoreWebView2?.Source,
+                            UriKind.Absolute,
+                            out Uri? parsedMainUri)
+                            ? parsedMainUri
+                            : null;
+                        if (popupWasOpened || IsGoogleAccountsHost(mainUri?.Host))
+                        {
+                            oauthClickIssued = true;
+                            oauthClickAt = DateTimeOffset.UtcNow;
+                            googleNavigationObserved = IsGoogleAccountsHost(mainUri?.Host);
+                            googlePageReady = false;
+                            googlePageLoadingReported = false;
+                            courseraReturnAt = null;
+                            await SetDirectLoginStatusAsync(
+                                "signing_in",
+                                popupWasOpened
+                                    ? "Đã mở cửa sổ đăng nhập Google."
+                                    : "Google đã mở trong cửa sổ đăng nhập.",
+                                cancellationToken: cancellationToken);
+                        }
+                        else
+                        {
+                            if (ReferenceEquals(_directLoginOAuthPopupOpened, popupOpened))
+                            {
+                                _directLoginOAuthPopupOpened = null;
+                            }
+                            await SetDirectLoginStatusAsync(
+                                "signing_in",
+                                "Đã bấm nút Google nhưng Coursera chưa yêu cầu cửa sổ đăng nhập; đang thử lại.",
+                                cancellationToken: cancellationToken);
+                            await Task.Delay(TimeSpan.FromSeconds(1), cancellationToken);
+                        }
+                    }
+                    else
+                    {
+                        if (ReferenceEquals(_directLoginOAuthPopupOpened, popupOpened))
+                        {
+                            _directLoginOAuthPopupOpened = null;
+                        }
+                        if (DateTimeOffset.UtcNow - oauthButtonWaitStartedAt.Value > TimeSpan.FromSeconds(30))
+                        {
+                            return new DirectLoginOutcome(
+                                DirectLoginOutcomeKind.Failed,
+                                "GOOGLE_SIGNIN_BUTTON_NOT_READY",
+                                "Coursera không tải được nút đăng nhập bằng Google.");
+                        }
                     }
                 }
             }
             else if (IsGoogleAccountsHost(host))
             {
-                googlePageSeen = true;
-                GoogleLoginPageState pageState = await ReadGoogleLoginPageStateAsync(activeWebView);
+                googleNavigationObserved = true;
+                GoogleLoginPageState pageState = await ReadGoogleLoginPageStateAsync(
+                    activeWebView,
+                    cancellationToken);
+                if (pageState.Step == "wait")
+                {
+                    if (!googlePageLoadingReported)
+                    {
+                        googlePageLoadingReported = true;
+                        await SetDirectLoginStatusAsync(
+                            "signing_in",
+                            "Google đã mở; đang tải biểu mẫu đăng nhập.",
+                            cancellationToken: cancellationToken);
+                    }
+                }
+                else
+                {
+                    googlePageReady = true;
+                }
                 switch (pageState.Step)
                 {
                     case "email":
                         if (!emailSubmitted && !string.IsNullOrWhiteSpace(email) &&
-                            await FillGoogleInputAndContinueAsync(activeWebView, "email", email))
+                            await FillGoogleInputAndContinueAsync(
+                                activeWebView,
+                                "email",
+                                email,
+                                cancellationToken))
                         {
                             emailSubmitted = true;
                             emailSubmittedAt = DateTimeOffset.UtcNow;
@@ -726,13 +1111,17 @@ public partial class MainWindow : Window
                     case "account_chooser":
                         if (!string.IsNullOrWhiteSpace(email))
                         {
-                            await SelectGoogleAccountAsync(activeWebView, email);
+                            await SelectGoogleAccountAsync(activeWebView, email, cancellationToken);
                         }
                         break;
 
                     case "password":
                         if (!passwordSubmitted && !string.IsNullOrEmpty(password) &&
-                            await FillGoogleInputAndContinueAsync(activeWebView, "password", password))
+                            await FillGoogleInputAndContinueAsync(
+                                activeWebView,
+                                "password",
+                                password,
+                                cancellationToken))
                         {
                             passwordSubmitted = true;
                             passwordSubmittedAt = DateTimeOffset.UtcNow;
@@ -818,7 +1207,7 @@ public partial class MainWindow : Window
                         break;
 
                     case "continue":
-                        await ClickGoogleContinueAsync(activeWebView);
+                        await ClickGoogleContinueAsync(activeWebView, cancellationToken);
                         break;
 
                     case "credential_error":
@@ -839,15 +1228,6 @@ public partial class MainWindow : Window
                             pageState.Code,
                             pageState.Message);
                 }
-            }
-
-            if (oauthClickIssued && oauthClickAt.HasValue && !googlePageSeen &&
-                DateTimeOffset.UtcNow - oauthClickAt.Value > TimeSpan.FromSeconds(30))
-            {
-                return new DirectLoginOutcome(
-                    DirectLoginOutcomeKind.Failed,
-                    "GOOGLE_OAUTH_NOT_OPENED",
-                    "Coursera không mở được trang đăng nhập Google.");
             }
 
             if (passwordSubmitted &&
@@ -880,13 +1260,104 @@ public partial class MainWindow : Window
         string Message,
         string? ChallengeNumber);
 
+    private static async Task<string?> ExecuteDirectLoginScriptAsync(
+        Microsoft.Web.WebView2.Core.CoreWebView2 webView,
+        string script,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            return await webView.ExecuteScriptAsync(script).WaitAsync(
+                DirectLoginWebViewOperationTimeout,
+                cancellationToken);
+        }
+        catch (TimeoutException)
+        {
+            // WebView2 can temporarily stop accepting script calls while an OAuth
+            // popup is being attached or a Google document is being replaced. The
+            // main state loop has a short, explicit recovery deadline for this.
+            return null;
+        }
+        catch (Exception) when (!cancellationToken.IsCancellationRequested)
+        {
+            return null;
+        }
+    }
+
+    private static async Task<string> ClickDirectLoginControlAsync(
+        Microsoft.Web.WebView2.Core.CoreWebView2 webView,
+        string locatorScript,
+        CancellationToken cancellationToken)
+    {
+        string located = DecodeWebViewString(
+            await ExecuteDirectLoginScriptAsync(webView, locatorScript, cancellationToken) ?? string.Empty);
+        if (string.IsNullOrWhiteSpace(located))
+        {
+            return "CLICK_FAILED";
+        }
+
+        try
+        {
+            using JsonDocument document = JsonDocument.Parse(located);
+            JsonElement root = document.RootElement;
+            string status = root.TryGetProperty("status", out JsonElement statusElement)
+                ? statusElement.GetString() ?? "CLICK_FAILED"
+                : "CLICK_FAILED";
+            if (status != "FOUND")
+            {
+                return status;
+            }
+
+            if (!root.TryGetProperty("x", out JsonElement xElement) ||
+                !root.TryGetProperty("y", out JsonElement yElement) ||
+                !xElement.TryGetDouble(out double x) ||
+                !yElement.TryGetDouble(out double y) ||
+                double.IsNaN(x) || double.IsNaN(y) ||
+                double.IsInfinity(x) || double.IsInfinity(y))
+            {
+                return "CLICK_FAILED";
+            }
+
+            string pressedPayload = JsonSerializer.Serialize(new
+            {
+                type = "mousePressed",
+                x,
+                y,
+                button = "left",
+                clickCount = 1
+            });
+            string releasedPayload = JsonSerializer.Serialize(new
+            {
+                type = "mouseReleased",
+                x,
+                y,
+                button = "left",
+                clickCount = 1
+            });
+            await webView.CallDevToolsProtocolMethodAsync(
+                "Input.dispatchMouseEvent",
+                pressedPayload).WaitAsync(DirectLoginWebViewOperationTimeout, cancellationToken);
+            await webView.CallDevToolsProtocolMethodAsync(
+                "Input.dispatchMouseEvent",
+                releasedPayload).WaitAsync(DirectLoginWebViewOperationTimeout, cancellationToken);
+            return "CLICKED";
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch
+        {
+            return "CLICK_FAILED";
+        }
+    }
+
     private async Task<GoogleLoginPageState> ReadGoogleLoginPageStateAsync(
-        Microsoft.Web.WebView2.Core.CoreWebView2 webView)
+        Microsoft.Web.WebView2.Core.CoreWebView2 webView,
+        CancellationToken cancellationToken)
     {
         string script = """
             (function() {
-                const skipGradedAppItems = __SKIP_GRADED__;
-                const skipPracticeAppItems = __SKIP_PRACTICE__;
                 const normalize = value => String(value || '')
                     .normalize('NFC').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
                 const lower = normalize(document.body?.innerText).toLocaleLowerCase();
@@ -1009,7 +1480,8 @@ public partial class MainWindow : Window
 
         try
         {
-            string raw = DecodeWebViewString(await webView.ExecuteScriptAsync(script));
+            string raw = DecodeWebViewString(
+                await ExecuteDirectLoginScriptAsync(webView, script, cancellationToken) ?? string.Empty);
             using JsonDocument document = JsonDocument.Parse(raw);
             JsonElement root = document.RootElement;
             return new GoogleLoginPageState(
@@ -1020,6 +1492,10 @@ public partial class MainWindow : Window
                     ? number.GetString()
                     : null);
         }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
         catch
         {
             return new GoogleLoginPageState("wait", string.Empty, string.Empty, null);
@@ -1029,7 +1505,8 @@ public partial class MainWindow : Window
     private async Task<bool> FillGoogleInputAndContinueAsync(
         Microsoft.Web.WebView2.Core.CoreWebView2 webView,
         string kind,
-        string value)
+        string value,
+        CancellationToken cancellationToken)
     {
         string valueJson = JsonSerializer.Serialize(value);
         string selector = kind == "password"
@@ -1049,11 +1526,14 @@ public partial class MainWindow : Window
                     bubbles: true, inputType: 'insertText', data: null
                 }));
                 input.dispatchEvent(new Event('change', { bubbles: true }));
-                const next = document.querySelector({{JsonSerializer.Serialize(nextSelector)}}) ||
-                    Array.from(document.querySelectorAll('button,[role="button"]')).find(button => {
+                const nextRoot = document.querySelector({{JsonSerializer.Serialize(nextSelector)}});
+                const fallbackNext = Array.from(document.querySelectorAll('button,[role="button"]')).find(button => {
                         const text = (button.innerText || button.textContent || '').trim().toLocaleLowerCase();
                         return text === 'next' || text === 'tiếp theo';
                     });
+                const next = nextRoot?.matches('button,[role="button"]')
+                    ? nextRoot
+                    : nextRoot?.querySelector('button,[role="button"]') || fallbackNext;
                 if (!next || next.getClientRects().length === 0) return 'NO_NEXT';
                 next.click();
                 return 'CLICKED';
@@ -1061,7 +1541,8 @@ public partial class MainWindow : Window
             """;
         try
         {
-            string result = DecodeWebViewString(await webView.ExecuteScriptAsync(script));
+            string result = DecodeWebViewString(
+                await ExecuteDirectLoginScriptAsync(webView, script, cancellationToken) ?? string.Empty);
             return result == "CLICKED";
         }
         finally
@@ -1073,7 +1554,8 @@ public partial class MainWindow : Window
 
     private async Task SelectGoogleAccountAsync(
         Microsoft.Web.WebView2.Core.CoreWebView2 webView,
-        string email)
+        string email,
+        CancellationToken cancellationToken)
     {
         string emailJson = JsonSerializer.Serialize(email);
         string script = $$"""
@@ -1089,7 +1571,7 @@ public partial class MainWindow : Window
             """;
         try
         {
-            await webView.ExecuteScriptAsync(script);
+            await ExecuteDirectLoginScriptAsync(webView, script, cancellationToken);
         }
         finally
         {
@@ -1099,7 +1581,8 @@ public partial class MainWindow : Window
     }
 
     private static async Task ClickGoogleContinueAsync(
-        Microsoft.Web.WebView2.Core.CoreWebView2 webView)
+        Microsoft.Web.WebView2.Core.CoreWebView2 webView,
+        CancellationToken cancellationToken)
     {
         const string script = """
             (function() {
@@ -1117,19 +1600,35 @@ public partial class MainWindow : Window
                 return 'CLICKED';
             })();
             """;
-        await webView.ExecuteScriptAsync(script);
+        await ExecuteDirectLoginScriptAsync(webView, script, cancellationToken);
     }
 
-    private async Task<bool> HasValidCourseraAuthCookieAsync()
+    private async Task<bool> HasValidCourseraAuthCookieAsync(CancellationToken cancellationToken = default)
     {
-        IReadOnlyList<Microsoft.Web.WebView2.Core.CoreWebView2Cookie> cookies =
-            await MainWebView.CoreWebView2.CookieManager.GetCookiesAsync("https://www.coursera.org");
-        return cookies.Any(cookie =>
-            string.Equals(cookie.Name, "CAUTH", StringComparison.Ordinal) &&
-            !string.IsNullOrWhiteSpace(cookie.Value) &&
-            IsCourseraCookieDomain(cookie.Domain) &&
-            (cookie.IsSession || cookie.Expires == DateTime.MinValue ||
-             cookie.Expires.ToUniversalTime() > DateTime.UtcNow.AddSeconds(15)));
+        try
+        {
+            IReadOnlyList<Microsoft.Web.WebView2.Core.CoreWebView2Cookie> cookies =
+                await MainWebView.CoreWebView2.CookieManager
+                    .GetCookiesAsync("https://www.coursera.org")
+                    .WaitAsync(TimeSpan.FromSeconds(5), cancellationToken);
+            return cookies.Any(cookie =>
+                string.Equals(cookie.Name, "CAUTH", StringComparison.Ordinal) &&
+                !string.IsNullOrWhiteSpace(cookie.Value) &&
+                IsCourseraCookieDomain(cookie.Domain) &&
+                (cookie.IsSession || cookie.Expires == DateTime.MinValue ||
+                 cookie.Expires.ToUniversalTime() > DateTime.UtcNow.AddSeconds(15)));
+        }
+        catch (TimeoutException)
+        {
+            // WebView2 can occasionally hold this request while an OAuth popup is
+            // being attached. Treat it as "not signed in" so the main loop keeps
+            // its Google-navigation timeout and recovery path alive.
+            return false;
+        }
+        catch (Exception) when (!cancellationToken.IsCancellationRequested)
+        {
+            return false;
+        }
     }
 
     private async Task<IReadOnlyCollection<VaultCookie>> ExportCourseraCookiesAsync()
@@ -1169,21 +1668,59 @@ public partial class MainWindow : Window
                domain.EndsWith(".coursera.org", StringComparison.OrdinalIgnoreCase);
     }
 
+    private const string ClickCourseraLoginButtonScript = """
+        (function() {
+            const normalize = value => String(value || '').replace(/\s+/g, ' ').trim().toLocaleLowerCase();
+            const visible = element => {
+                if (!element || element.getClientRects().length === 0) return false;
+                const rect = element.getBoundingClientRect();
+                const style = getComputedStyle(element);
+                return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' &&
+                    style.display !== 'none' && style.pointerEvents !== 'none';
+            };
+            const candidates = Array.from(document.querySelectorAll('button,a,[role="button"]')).filter(visible);
+            const login = candidates.find(element => {
+                const text = normalize(element.innerText || element.textContent);
+                const label = normalize(element.getAttribute('aria-label'));
+                const href = normalize(element.getAttribute('href'));
+                return text === 'log in' || text === 'login' || text === 'đăng nhập' ||
+                    label === 'log in' || label === 'login' || label === 'đăng nhập' ||
+                    (/login/.test(href) && (text === 'log in' || text === 'login'));
+            });
+            if (!login) return JSON.stringify({ status: 'NO_LOGIN' });
+            const rect = login.getBoundingClientRect();
+            return JSON.stringify({
+                status: 'FOUND',
+                x: rect.left + rect.width / 2,
+                y: rect.top + rect.height / 2
+            });
+        })();
+        """;
+
     private const string ClickCourseraGoogleButtonScript = """
         (function() {
             const normalize = value => String(value || '').replace(/\s+/g, ' ').trim().toLocaleLowerCase();
-            const candidates = Array.from(document.querySelectorAll('button,a,[role="button"]'));
+            const visible = element => {
+                if (!element || element.getClientRects().length === 0) return false;
+                const rect = element.getBoundingClientRect();
+                const style = getComputedStyle(element);
+                return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' &&
+                    style.display !== 'none' && style.pointerEvents !== 'none';
+            };
+            const isGoogleSignInLabel = value => /^(continue|sign in|log in|login|đăng nhập|tiếp tục)(\s+(with|bằng|với))?\s+google(\s+account)?$/.test(value);
+            const candidates = Array.from(document.querySelectorAll('button,a,[role="button"]')).filter(visible);
             const button = candidates.find(element => {
-                if (element.getClientRects().length === 0) return false;
                 const text = normalize(element.innerText || element.textContent);
                 const label = normalize(element.getAttribute('aria-label'));
-                return text === 'continue with google' || text === 'sign in with google' ||
-                    text === 'tiếp tục với google' || text === 'đăng nhập bằng google' ||
-                    label.includes('google');
+                return isGoogleSignInLabel(text) || isGoogleSignInLabel(label);
             });
-            if (!button) return 'NO_BUTTON';
-            button.click();
-            return 'CLICKED';
+            if (!button) return JSON.stringify({ status: 'NO_BUTTON' });
+            const rect = button.getBoundingClientRect();
+            return JSON.stringify({
+                status: 'FOUND',
+                x: rect.left + rect.width / 2,
+                y: rect.top + rect.height / 2
+            });
         })();
         """;
 
@@ -1250,6 +1787,8 @@ public partial class MainWindow : Window
     private async void WorkerHeartbeatTimer_Tick(object? sender, EventArgs e)
     {
         if (_workerClosing || !_workerHeartbeatLock.Wait(0)) return;
+        bool shouldPauseCourse = false;
+        string pauseReason = "Đã tạm dừng theo yêu cầu từ trang theo dõi.";
         try
         {
             string activity = _viewModel.StatusText ?? "Worker đang chạy";
@@ -1297,12 +1836,20 @@ public partial class MainWindow : Window
                     progressSnapshot = _lastCourseProgressSnapshot;
                 }
 
-                await _centralWorkerClient.HeartbeatAsync(
+                WorkerJob refreshedJob = await _centralWorkerClient.HeartbeatAsync(
                     "running",
                     activity,
                     progressSnapshot?.Progress,
                     progressSnapshot?.CurrentModule,
                     progressSnapshot?.TotalModules);
+                if (refreshedJob.PauseRequested)
+                {
+                    shouldPauseCourse = true;
+                    if (!string.IsNullOrWhiteSpace(refreshedJob.PauseRequestedReason))
+                    {
+                        pauseReason = refreshedJob.PauseRequestedReason;
+                    }
+                }
             }
         }
         catch
@@ -1312,6 +1859,14 @@ public partial class MainWindow : Window
         finally
         {
             _workerHeartbeatLock.Release();
+        }
+
+        if (shouldPauseCourse && !_workerClosing)
+        {
+            await PauseCourseJobAsync(
+                "⏸️ Worker đã tạm dừng; profile đã sẵn sàng để thao tác thủ công.",
+                pauseReason,
+                "ADMIN_PAUSED");
         }
     }
 
@@ -1327,12 +1882,33 @@ public partial class MainWindow : Window
             return null;
         }
 
+        // Keep the live dashboard consistent with the lesson scanner.  Coursera
+        // shows an accepted submission as incomplete until grading finishes,
+        // but this Worker must not count it as another item to retry.
+        string pendingResultPathsJson = JsonSerializer.Serialize(
+            _pendingGradedResultPaths.ToArray());
+        string submittedDiscussionPathsJson = JsonSerializer.Serialize(
+            _submittedDiscussionPaths.ToArray());
+        string skippedLaunchAppItemPathsJson = JsonSerializer.Serialize(
+            _skippedLaunchAppItemPaths.ToArray());
+        string automationCompletedModulesJson = JsonSerializer.Serialize(
+            _automationCompletedModuleNumbers.ToArray());
+
         string script = """
             (function() {
                 const skipGradedAppItems = __SKIP_GRADED__;
                 const skipPracticeAppItems = __SKIP_PRACTICE__;
+                const skipPeerItems = __SKIP_PEER__;
+                const pendingResultPaths = new Set(__PENDING_RESULT_PATHS__);
+                const submittedDiscussionPaths = new Set(__SUBMITTED_DISCUSSION_PATHS__);
+                const skippedLaunchAppItemPaths = new Set(__SKIPPED_LAUNCH_APP_PATHS__);
+                const automationCompletedModules = new Set(__AUTOMATION_COMPLETED_MODULES__);
                 const normalize = value => String(value || '')
                     .replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
+                const normalizePath = value => {
+                    const path = String(value || '').replace(/\/+$/, '');
+                    return path || '/';
+                };
                 const unique = values => Array.from(new Set(values));
                 const modules = unique(Array.from(document.querySelectorAll(
                     'a[data-testid="rc-WeekNavigationItem"], ' +
@@ -1348,8 +1924,20 @@ public partial class MainWindow : Window
 
                 const moduleLabel = module =>
                     normalize(module.getAttribute('aria-label') || module.innerText);
-                const moduleCompleted = module =>
-                    /\bComplete(?:d)?\b/i.test(moduleLabel(module));
+                const moduleNumber = (module, index) => {
+                    const labelMatch = moduleLabel(module).match(/^Module\s+(\d+)\b/i);
+                    if (labelMatch) return Number(labelMatch[1]);
+                    try {
+                        const pathMatch = new URL(
+                            module.getAttribute('href') || '',
+                            window.location.href).pathname.match(/\/home\/(?:week|module)\/(\d+)/i);
+                        if (pathMatch) return Number(pathMatch[1]);
+                    } catch (_) { }
+                    return index + 1;
+                };
+                const moduleCompleted = (module, index) =>
+                    /\bComplete(?:d)?\b/i.test(moduleLabel(module)) ||
+                    automationCompletedModules.has(moduleNumber(module, index));
                 let currentIndex = modules.findIndex(module => {
                     const label = moduleLabel(module);
                     return module.getAttribute('aria-current') === 'page' ||
@@ -1357,9 +1945,22 @@ public partial class MainWindow : Window
                         module.getAttribute('aria-expanded') === 'true' ||
                         /\bselected\b/i.test(label);
                 });
+                if (currentIndex < 0) {
+                    const currentPath = normalizePath(window.location.pathname);
+                    currentIndex = modules.findIndex(module => {
+                        try {
+                            return normalizePath(new URL(
+                                module.getAttribute('href') || '',
+                                window.location.href).pathname) === currentPath;
+                        } catch (_) {
+                            return false;
+                        }
+                    });
+                }
                 const completedModules = modules.filter(moduleCompleted).length;
                 if (currentIndex < 0) {
-                    currentIndex = modules.findIndex(module => !moduleCompleted(module));
+                    currentIndex = modules.findIndex((module, index) =>
+                        !moduleCompleted(module, index));
                     if (currentIndex < 0) currentIndex = modules.length - 1;
                 }
 
@@ -1370,15 +1971,42 @@ public partial class MainWindow : Window
                 let supportedLessons = 0;
                 let completedLessons = 0;
                 let skippedAppItems = 0;
+                let skippedPeerItems = 0;
+                let skippedPendingResults = 0;
+                let skippedSubmittedDiscussions = 0;
                 for (const lesson of lessons) {
                     const html = lesson.innerHTML || '';
                     const ariaLabel = lesson.getAttribute('aria-label') || '';
+                    const href = lesson.getAttribute('href') || '';
                     const itemText = normalize(ariaLabel + ' ' + (lesson.innerText || ''));
+                    let lessonPath = '';
+                    try {
+                        lessonPath = normalizePath(
+                            new URL(href, window.location.href).pathname);
+                    } catch (_) { }
+                    if (lessonPath && skippedLaunchAppItemPaths.has(lessonPath)) {
+                        skippedAppItems++;
+                        continue;
+                    }
+                    if (lessonPath && pendingResultPaths.has(lessonPath)) {
+                        skippedPendingResults++;
+                        continue;
+                    }
+                    if (lessonPath && submittedDiscussionPaths.has(lessonPath)) {
+                        skippedSubmittedDiscussions++;
+                        continue;
+                    }
                     const isGradedAppItem = /\bGraded App Item\b/i.test(itemText);
-                    const isPracticeAppItem = /\bPractice App Item\b/i.test(itemText);
+                    const isPracticeAppItem = /\b(?:Practice|Ungraded) App Item\b/i.test(itemText);
+                    const isPeerItem = /\/peer(?:\/|$)/i.test(href) ||
+                        /\bpeer[-\s]?(?:graded|review(?:ed)?)\b|\bpeer\s+(?:assessment|assignment)\b/i.test(itemText);
                     if ((skipGradedAppItems && isGradedAppItem) ||
                         (skipPracticeAppItems && isPracticeAppItem)) {
                         skippedAppItems++;
+                        continue;
+                    }
+                    if (skipPeerItems && isPeerItem) {
+                        skippedPeerItems++;
                         continue;
                     }
                     supportedLessons++;
@@ -1391,10 +2019,13 @@ public partial class MainWindow : Window
                     }
                 }
 
-                let moduleFraction = moduleCompleted(modules[currentIndex]) ? 1 : 0;
+                let moduleFraction = moduleCompleted(modules[currentIndex], currentIndex) ? 1 : 0;
                 if (supportedLessons > 0) {
                     moduleFraction = completedLessons / supportedLessons;
-                } else if (skippedAppItems > 0) {
+                } else if (skippedAppItems > 0 ||
+                    skippedPeerItems > 0 ||
+                    skippedPendingResults > 0 ||
+                    skippedSubmittedDiscussions > 0) {
                     moduleFraction = 1;
                 }
 
@@ -1416,7 +2047,12 @@ public partial class MainWindow : Window
             })();
             """
             .Replace("__SKIP_GRADED__", ShouldSkipGradedAppItems ? "true" : "false")
-            .Replace("__SKIP_PRACTICE__", ShouldSkipPracticeAppItems ? "true" : "false");
+            .Replace("__SKIP_PRACTICE__", ShouldSkipPracticeAppItems ? "true" : "false")
+            .Replace("__SKIP_PEER__", ShouldSkipPeerItems ? "true" : "false")
+            .Replace("__PENDING_RESULT_PATHS__", pendingResultPathsJson)
+            .Replace("__SUBMITTED_DISCUSSION_PATHS__", submittedDiscussionPathsJson)
+            .Replace("__SKIPPED_LAUNCH_APP_PATHS__", skippedLaunchAppItemPathsJson)
+            .Replace("__AUTOMATION_COMPLETED_MODULES__", automationCompletedModulesJson);
 
         try
         {
@@ -1460,9 +2096,12 @@ public partial class MainWindow : Window
                 return;
             }
 
-            string completionNote = _courseHasSkippedLaunchAppItems
-                ? "✅ Hoàn thành các bài tự động. Còn bài Launch App (Graded/Practice App Item) đã bỏ qua và cần xử lý riêng."
-                : "✅ Đã hoàn thành toàn bộ các bài trong khóa học.";
+            string completionNote = GetCourseCompletionNote();
+            if (_courseHasSubmittedDiscussionItems)
+            {
+                completionNote = completionNote.TrimEnd('.', ' ') +
+                    ". Phản hồi Discussion đã gửi được giữ nguyên và không chạy lại.";
+            }
             _viewModel.StatusText = completionNote;
             _lastCourseProgressSnapshot = new CourseProgressSnapshot(
                 100,
@@ -1475,8 +2114,38 @@ public partial class MainWindow : Window
                 totalModules,
                 totalModules);
 
-            // Backend đã xác nhận job và order hoàn thành; đóng worker để host không giữ
-            // một tiến trình đã xong và cũng không gửi heartbeat running trở lại.
+            WorkerJob? nextJob = await _centralWorkerClient.ClaimNextBatchJobAsync();
+            if (nextJob != null)
+            {
+                _courseHasSkippedLaunchAppItems = false;
+                _skippedLaunchAppItemPaths.Clear();
+                _automationCompletedModuleNumbers.Clear();
+                _courseHasSkippedPeerItems = false;
+                _courseHasPendingGradedResults = false;
+                _pendingGradedResultPaths.Clear();
+                _courseHasSubmittedDiscussionItems = false;
+                _submittedDiscussionPaths.Clear();
+                _courseJobCompletionReported = false;
+                _coursePauseInProgress = false;
+                _courseLandingFallbackCount = 0;
+                _lastCourseProgressSnapshot = null;
+                _viewModel.StatusText =
+                    "✅ Khóa hiện tại đã xong. Giữ nguyên phiên khách và chuyển sang khóa tiếp theo...";
+                await _centralWorkerClient.HeartbeatAsync(
+                    "running",
+                    "Đã giữ phiên khách; đang mở khóa tiếp theo trong batch",
+                    nextJob.Progress,
+                    nextJob.CurrentModule,
+                    nextJob.TotalModules);
+                _workerHeartbeatTimer?.Start();
+                UrlTextBox.Text = string.IsNullOrWhiteSpace(nextJob.TargetUrl)
+                    ? "https://www.coursera.org/"
+                    : nextJob.TargetUrl;
+                OnTestClick(this, new RoutedEventArgs());
+                return;
+            }
+
+            // Batch đã hết job, đóng worker để host nhận batch/tài khoản kế tiếp.
             _workerClosing = true;
             await Task.Delay(350);
             Close();
@@ -1493,6 +2162,197 @@ public partial class MainWindow : Window
         }
     }
 
+    private string GetCourseCompletionNote()
+    {
+        if (_courseHasPendingGradedResults &&
+            _courseHasSkippedPeerItems &&
+            _courseHasSkippedLaunchAppItems)
+        {
+            return "✅ Đã hoàn thành hết các bài tự động. Còn bài đã nộp đang chờ chấm điểm, " +
+                "Peer-graded/Peer Review và Launch App (Graded/Practice App Item) cần xử lý thủ công.";
+        }
+
+        if (_courseHasPendingGradedResults && _courseHasSkippedPeerItems)
+        {
+            return "✅ Đã hoàn thành hết các bài tự động. Còn bài đã nộp đang chờ chấm điểm và " +
+                "các bài Peer-graded/Peer Review cần xử lý thủ công.";
+        }
+
+        if (_courseHasPendingGradedResults && _courseHasSkippedLaunchAppItems)
+        {
+            return "✅ Đã hoàn thành các bài tự động. Còn bài đã nộp đang chờ chấm điểm và " +
+                "Launch App (Graded/Practice App Item) cần xử lý riêng.";
+        }
+
+        if (_courseHasPendingGradedResults)
+        {
+            return "✅ Đã hoàn thành các bài tự động. Còn bài đã nộp đang chờ Coursera chấm điểm.";
+        }
+
+        if (_courseHasSkippedPeerItems && _courseHasSkippedLaunchAppItems)
+        {
+            return "✅ Đã hoàn thành hết các bài tự động. Còn Peer-graded/Peer Review và " +
+                "Launch App (Graded/Practice App Item) cần xử lý thủ công.";
+        }
+
+        if (_courseHasSkippedPeerItems)
+        {
+            return "✅ Đã hoàn thành hết các bài tự động. Chỉ còn các bài Peer-graded và " +
+                "Peer Review cần xử lý thủ công.";
+        }
+
+        if (_courseHasSkippedLaunchAppItems)
+        {
+            return "✅ Hoàn thành các bài tự động. Còn bài Launch App " +
+                "(Graded/Practice App Item) đã bỏ qua và cần xử lý riêng.";
+        }
+
+        return "✅ Đã hoàn thành toàn bộ các bài trong khóa học.";
+    }
+
+    private Task FailCourseJobForAiErrorAsync(string aiMessage) =>
+        FailCourseJobAsync("❌ Lỗi AI: " + aiMessage);
+
+    private async Task PauseCourseJobAsync(
+        string activity,
+        string manualActionReason,
+        string errorCode)
+    {
+        if (_workerLaunchOptions.IsDirectLogin ||
+            IsInteractiveBrowseSession ||
+            _centralWorkerClient.CurrentJob is not { } jobToPause ||
+            _courseJobCompletionReported ||
+            _coursePauseInProgress ||
+            _workerClosing)
+        {
+            return;
+        }
+
+        _coursePauseInProgress = true;
+        _courseJobCompletionReported = true;
+        _workerHeartbeatTimer?.Stop();
+        _viewModel.StatusText = activity;
+        bool reported = false;
+        try
+        {
+            CourseProgressSnapshot? snapshot =
+                await ReadCourseProgressSnapshotAsync() ?? _lastCourseProgressSnapshot;
+            using var reportTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+            await _workerHeartbeatLock.WaitAsync(reportTimeout.Token);
+            try
+            {
+                if (_centralWorkerClient.CurrentJob is not { } currentJob ||
+                    !string.Equals(currentJob.Id, jobToPause.Id, StringComparison.Ordinal))
+                {
+                    _coursePauseInProgress = false;
+                    _courseJobCompletionReported = false;
+                    _workerHeartbeatTimer?.Start();
+                    return;
+                }
+
+                await _centralWorkerClient.PauseAsync(
+                    activity,
+                    manualActionReason,
+                    errorCode,
+                    snapshot?.Progress,
+                    snapshot?.CurrentModule,
+                    snapshot?.TotalModules,
+                    reportTimeout.Token);
+                reported = true;
+            }
+            finally
+            {
+                _workerHeartbeatLock.Release();
+            }
+        }
+        catch (Exception exception)
+        {
+            _coursePauseInProgress = false;
+            _courseJobCompletionReported = false;
+            _workerHeartbeatTimer?.Start();
+            _viewModel.StatusText =
+                activity + " (chưa báo được trung tâm: " + exception.Message + ")";
+        }
+
+        if (!reported)
+        {
+            return;
+        }
+
+        // The central server has released this worker from the durable profile.
+        // Close intentionally so MainWindow_Closed never overwrites the manual
+        // pause with a failure and Worker Host can launch a visible browse job.
+        _workerClosing = true;
+        await Task.Delay(350);
+        Close();
+    }
+
+    private async Task FailCourseJobAsync(string activity)
+    {
+        _viewModel.StatusText = activity;
+
+        if (_workerLaunchOptions.IsDirectLogin ||
+            _centralWorkerClient.CurrentJob is not { } jobToFail ||
+            _courseJobCompletionReported ||
+            _workerClosing)
+        {
+            return;
+        }
+
+        // A terminal workflow failure means this worker cannot make further safe
+        // progress on the current course. Stop heartbeats before reporting a
+        // terminal state so the server never sees the same job as running forever.
+        _courseJobCompletionReported = true;
+        _workerHeartbeatTimer?.Stop();
+        var reported = false;
+        try
+        {
+            using var reportTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+            await _workerHeartbeatLock.WaitAsync(reportTimeout.Token);
+            try
+            {
+                // A completion path can claim the next course in a batch while
+                // an older AI request is still unwinding.  Never fail that next
+                // course with the stale result from the previous one.
+                if (_centralWorkerClient.CurrentJob is not { } currentJob ||
+                    !string.Equals(currentJob.Id, jobToFail.Id, StringComparison.Ordinal))
+                {
+                    return;
+                }
+
+                await _centralWorkerClient.FailAsync(activity, reportTimeout.Token);
+                reported = true;
+            }
+            finally
+            {
+                _workerHeartbeatLock.Release();
+            }
+        }
+        catch
+        {
+            // A temporary central-server outage should not close the browser and
+            // lose the recoverable course session. Resume the ordinary heartbeat.
+            if (_centralWorkerClient.CurrentJob is { } currentJob &&
+                string.Equals(currentJob.Id, jobToFail.Id, StringComparison.Ordinal))
+            {
+                _courseJobCompletionReported = false;
+                _workerHeartbeatTimer?.Start();
+                _viewModel.StatusText = activity + " (chưa báo được trung tâm; sẽ thử lại)";
+            }
+        }
+
+        if (!reported ||
+            _centralWorkerClient.CurrentJob is not { } activeJob ||
+            !string.Equals(activeJob.Id, jobToFail.Id, StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        _workerClosing = true;
+        await Task.Delay(350);
+        Close();
+    }
+
     private async void MainWebView_NewWindowRequested(
         object? sender,
         Microsoft.Web.WebView2.Core.CoreWebView2NewWindowRequestedEventArgs e)
@@ -1506,9 +2366,10 @@ public partial class MainWindow : Window
                 await _directLoginPopupLock.WaitAsync();
                 try
                 {
-                    if (_directLoginOAuthController != null)
+                    if (_directLoginOAuthWindow != null || _directLoginOAuthWebView != null)
                     {
                         _directLoginOAuthFailure = "Google đã yêu cầu nhiều cửa sổ đăng nhập cùng lúc.";
+                        _directLoginOAuthPopupOpened?.TrySetResult(false);
                         return;
                     }
                     if (!IsAllowedDirectLoginPopupUri(e.Uri))
@@ -1516,35 +2377,76 @@ public partial class MainWindow : Window
                         _directLoginOAuthFailure = BuildBlockedOAuthDestinationMessage(
                             "Google trả về",
                             e.Uri);
+                        _directLoginOAuthPopupOpened?.TrySetResult(false);
                         return;
                     }
                     _directLoginOAuthExpectedRedirectUri ??=
                         TryExtractGoogleOAuthRedirectUri(e.Uri);
 
-                    IntPtr parentWindow = new System.Windows.Interop.WindowInteropHelper(this).Handle;
-                    Microsoft.Web.WebView2.Core.CoreWebView2Controller controller =
-                        await MainWebView.CoreWebView2.Environment
-                            .CreateCoreWebView2ControllerAsync(parentWindow);
-                    _directLoginOAuthController = controller;
-                    // Google keeps multiple sign-in steps mounted and animates between them.
-                    // A 1x1 controller leaves the next step at zero layout size, so automation
-                    // can remain on the identifier screen even after Google changes the URL.
-                    controller.Bounds = new System.Drawing.Rectangle(0, 0, 1280, 900);
-                    controller.IsVisible = false;
-                    controller.CoreWebView2.Settings.IsPasswordAutosaveEnabled = false;
-                    controller.CoreWebView2.Settings.IsGeneralAutofillEnabled = false;
-                    controller.CoreWebView2.NavigationStarting += DirectLoginOAuth_NavigationStarting;
-                    controller.CoreWebView2.NewWindowRequested += (_, childArgs) =>
+                    // Host OAuth in a real WPF WebView2 window. The former raw HWND
+                    // controller was outside WPF layout and could be covered by the
+                    // main Coursera view, making a successful click look like nothing
+                    // had happened.
+                    var popupBrowser = new Microsoft.Web.WebView2.Wpf.WebView2();
+                    var popupWindow = new Window
                     {
-                        childArgs.Handled = true;
-                        _directLoginOAuthFailure =
-                            "Google yêu cầu thêm một cửa sổ ngoài luồng đăng nhập được phép.";
+                        Owner = this,
+                        Title = "ACOSE · Đăng nhập Google",
+                        Width = 980,
+                        Height = 760,
+                        MinWidth = 720,
+                        MinHeight = 540,
+                        WindowStartupLocation = WindowStartupLocation.CenterOwner,
+                        ShowInTaskbar = true,
+                        Content = popupBrowser
                     };
-                    controller.CoreWebView2.WindowCloseRequested += (_, _) =>
-                        Dispatcher.BeginInvoke(CloseDirectLoginOAuthController);
+                    popupWindow.Closed += (_, _) =>
+                    {
+                        if (ReferenceEquals(_directLoginOAuthWindow, popupWindow))
+                        {
+                            _directLoginOAuthWindow = null;
+                            _directLoginOAuthBrowser = null;
+                            _directLoginOAuthWebView = null;
+                            _directLoginOAuthExpectedRedirectUri = null;
+                        }
+                    };
 
-                    _directLoginOAuthWebView = controller.CoreWebView2;
-                    e.NewWindow = controller.CoreWebView2;
+                    _directLoginOAuthWindow = popupWindow;
+                    _directLoginOAuthBrowser = popupBrowser;
+                    popupWindow.Show();
+                    await popupBrowser.EnsureCoreWebView2Async(
+                        MainWebView.CoreWebView2.Environment);
+                    Microsoft.Web.WebView2.Core.CoreWebView2 oauthWebView =
+                        popupBrowser.CoreWebView2
+                        ?? throw new InvalidOperationException("OAuth WebView2 is not initialized.");
+                    oauthWebView.Settings.IsPasswordAutosaveEnabled = false;
+                    oauthWebView.Settings.IsGeneralAutofillEnabled = false;
+                    oauthWebView.NavigationStarting += DirectLoginOAuth_NavigationStarting;
+                    oauthWebView.NewWindowRequested += (_, childArgs) =>
+                    {
+                        if (!IsAllowedDirectLoginPopupUri(childArgs.Uri))
+                        {
+                            childArgs.Handled = true;
+                            _directLoginOAuthFailure = BuildBlockedOAuthDestinationMessage(
+                                "Google yêu cầu mở",
+                                childArgs.Uri);
+                        }
+                    };
+                    oauthWebView.WindowCloseRequested += (_, _) =>
+                        Dispatcher.BeginInvoke(CloseDirectLoginOAuthWindow);
+                    oauthWebView.ProcessFailed += (_, _) =>
+                    {
+                        if (_directLoginActive && !_directLoginTerminal)
+                        {
+                            _directLoginOAuthFailure =
+                                "Cửa sổ đăng nhập Google đã dừng đột ngột. Vui lòng thử lại.";
+                            _directLoginOAuthPopupOpened?.TrySetResult(false);
+                        }
+                    };
+
+                    _directLoginOAuthWebView = oauthWebView;
+                    e.NewWindow = oauthWebView;
+                    _directLoginOAuthPopupOpened?.TrySetResult(true);
                 }
                 finally
                 {
@@ -1554,7 +2456,8 @@ public partial class MainWindow : Window
             catch
             {
                 _directLoginOAuthFailure = "Máy chủ không tạo được cửa sổ đăng nhập Google an toàn.";
-                CloseDirectLoginOAuthController();
+                _directLoginOAuthPopupOpened?.TrySetResult(false);
+                CloseDirectLoginOAuthWindow();
             }
             finally
             {
@@ -1639,7 +2542,8 @@ public partial class MainWindow : Window
     private static bool IsGoogleAccountsHost(string? host)
     {
         return IsHostOrSubdomain(host, "accounts.google.com") ||
-               string.Equals(host, "accounts.google.com.vn", StringComparison.OrdinalIgnoreCase);
+               IsHostOrSubdomain(host, "accounts.google.com.vn") ||
+               IsHostOrSubdomain(host, "accounts.youtube.com");
     }
 
     private bool IsAllowedDirectLoginPopupUri(string? value)
@@ -1750,23 +2654,27 @@ public partial class MainWindow : Window
             e.Uri);
     }
 
-    private void CloseDirectLoginOAuthController()
+    private void CloseDirectLoginOAuthWindow()
     {
-        Microsoft.Web.WebView2.Core.CoreWebView2Controller? controller =
-            _directLoginOAuthController;
-        _directLoginOAuthController = null;
+        Window? popupWindow = _directLoginOAuthWindow;
+        Microsoft.Web.WebView2.Core.CoreWebView2? popupWebView = _directLoginOAuthWebView;
+        _directLoginOAuthWindow = null;
+        _directLoginOAuthBrowser = null;
         _directLoginOAuthWebView = null;
         _directLoginOAuthExpectedRedirectUri = null;
-        if (controller == null)
+        if (popupWindow == null)
         {
             return;
         }
         try
         {
-            controller.CoreWebView2.NavigationStarting -= DirectLoginOAuth_NavigationStarting;
+            if (popupWebView != null)
+            {
+                popupWebView.NavigationStarting -= DirectLoginOAuth_NavigationStarting;
+            }
         }
         catch { }
-        try { controller.Close(); } catch { }
+        try { popupWindow.Close(); } catch { }
     }
 
     private static bool IsCourseraLockUri(string? uri)
@@ -2060,10 +2968,15 @@ public partial class MainWindow : Window
                 
                 // Cảm biến Cul-de-sac (Ngõ cụt): Không có nút Next, nhưng trang đã load xong
                 var isPageLoaded = document.querySelector('div[data-testid=""page-header-wrapper""]') !== null || document.querySelector('.rc-MetatagsWrapper') !== null;
-                // Nếu đang ở bài thi (exam/quiz) hoặc dialogue mà không thấy nút Next thì ĐÓ LÀ BÌNH THƯỜNG (chưa làm xong), không phải ngõ cụt!
-                var isExam = window.location.href.includes('/exam/') || window.location.href.includes('/quiz/') || window.location.href.includes('/dialogue/') || window.location.href.includes('/coach/');
+                // Các trang tương tác chưa hoàn tất (quiz, dialogue, peer review, ...)
+                // thường không hiện nút Next. Chúng không phải là cuối khoá học.
+                var isIncompleteActivity = window.location.href.includes('/exam/') ||
+                    window.location.href.includes('/quiz/') ||
+                    window.location.href.includes('/dialogue/') ||
+                    window.location.href.includes('/coach/') ||
+                    window.location.href.includes('/peer/');
                 
-                if (isPageLoaded && !nextBtn && !isExam) {
+                if (isPageLoaded && !nextBtn && !isIncompleteActivity) {
                     return 'END_OF_COURSE';
                 }
                 
@@ -2105,90 +3018,525 @@ public partial class MainWindow : Window
 
     private async Task Checkkhoahoc()
     {
-        _viewModel.StatusText = "Đang check khoá học...";
+        if (_isHandlingCourseLanding)
+        {
+            return;
+        }
 
-        string jsCode = @"
-            (function() {
-                var goToCourseBtn = document.querySelector('button[data-e2e=""enroll-button""]');
-                if (goToCourseBtn) {
-                    goToCourseBtn.click();
-                    return '✅ Khoá học đã đăng kí. Đang vào khoá học...';
-                }
-        
-                var enrollBtn = document.querySelector('button[data-e2e=""EnrollButton""]');
-                if (enrollBtn) {
-                    enrollBtn.click();
-                    return '⚠️ Khoá học chưa đăng kí. Đang tiến hành đăng ký và vào lớp...';
-                }
-        
-                return '❌ Không tìm thấy nút nào có điểm neo data-e2e hợp lệ!';
-            })();
-        ";
-
+        _isHandlingCourseLanding = true;
         try
         {
-            string result = await MainWebView.ExecuteScriptAsync(jsCode);
-            if (result != null)
+            Uri? landingUri = MainWebView.Source;
+            if (!IsCourseraUri(landingUri) ||
+                !TryGetCourseHomeUri(landingUri, out Uri? courseHomeUri) ||
+                courseHomeUri == null)
             {
-                result = result.Trim('"');
-                _viewModel.StatusText = result;
+                await PauseCourseJobAsync(
+                    "⏸️ Không xác định được khu vực học; Worker đã dừng để tránh lặp vô hạn.",
+                    "Hãy mở profile, kiểm tra quyền truy cập đúng khóa rồi bấm Tiếp tục.",
+                    "COURSE_ENTRY_UNAVAILABLE");
+                return;
             }
+
+            _viewModel.StatusText = "🔎 Đang tìm nút vào khóa học...";
+            const string probeTemplate = """
+                (function() {
+                    const target = new URL(__EXPECTED_URL_JSON__);
+                    const current = new URL(location.href);
+                    if (current.origin !== target.origin ||
+                        current.pathname !== target.pathname ||
+                        current.search !== target.search) {
+                        return JSON.stringify({ State: 'STALE_DOCUMENT', Href: null, Label: null });
+                    }
+
+                    const normalize = value => String(value || '')
+                        .replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
+                    const isVisibleAndEnabled = element => {
+                        if (!(element instanceof HTMLElement) || !element.isConnected ||
+                            element.matches('[disabled], [aria-disabled="true"]')) {
+                            return false;
+                        }
+                        const style = window.getComputedStyle(element);
+                        const rect = element.getBoundingClientRect();
+                        return !!style && style.display !== 'none' &&
+                            style.visibility !== 'hidden' &&
+                            style.visibility !== 'collapse' &&
+                            Number(style.opacity || '1') > 0 &&
+                            rect.width > 0 && rect.height > 0;
+                    };
+                    const accessibleText = element => normalize(
+                        element.getAttribute('aria-label') ||
+                        element.getAttribute('title') ||
+                        element.innerText ||
+                        element.textContent || '');
+                    const allowedNames = new Set([
+                        'go to course',
+                        'continue learning',
+                        'continue course',
+                        'resume course',
+                        'start course'
+                    ]);
+                    const controls = Array.from(document.querySelectorAll('a, button, [role="button"]'))
+                        .filter(isVisibleAndEnabled);
+                    const exactMatches = controls.filter(control =>
+                        allowedNames.has(accessibleText(control)));
+                    const attributeMatches = controls.filter(control => {
+                        const attributes = [
+                            control.getAttribute('data-e2e'),
+                            control.getAttribute('data-testid'),
+                            control.getAttribute('data-track-component'),
+                            control.getAttribute('data-track-action')
+                        ].map(normalize).join(' ');
+                        return /(?:^|[\s_-])go[\s_-]?to[\s_-]?course(?:$|[\s_-])/i.test(attributes);
+                    });
+                    const candidates = exactMatches.length > 0 ? exactMatches : attributeMatches;
+                    if (candidates.length === 1) {
+                        const candidate = candidates[0];
+                        const anchor = candidate instanceof HTMLAnchorElement
+                            ? candidate
+                            : candidate.closest('a[href]');
+                        const href = anchor ? anchor.href : null;
+                        if (href) {
+                            return JSON.stringify({
+                                State: 'OPEN_HREF',
+                                Href: href,
+                                Label: accessibleText(candidate)
+                            });
+                        }
+                        candidate.click();
+                        return JSON.stringify({
+                            State: 'CLICKED',
+                            Href: null,
+                            Label: accessibleText(candidate)
+                        });
+                    }
+                    if (candidates.length > 1) {
+                        return JSON.stringify({ State: 'AMBIGUOUS', Href: null, Label: null });
+                    }
+
+                    const paidOrTrialLabels = new Set([
+                        'start free trial', 'buy now', 'purchase',
+                        'subscribe', 'choose a plan', 'start trial',
+                        'view plans', 'see plans', 'get coursera plus',
+                        'try coursera plus', 'join coursera plus',
+                        'upgrade to coursera plus', 'upgrade to plus'
+                    ]);
+                    const freeEnrollmentLabels = new Set([
+                        'enroll', 'enroll for free', 'join for free'
+                    ]);
+                    const enrollmentCandidates = controls.filter(control => {
+                        const label = accessibleText(control);
+                        const attributes = [
+                            control.getAttribute('data-e2e'),
+                            control.getAttribute('data-testid'),
+                            control.getAttribute('data-track-component'),
+                            control.getAttribute('data-track-action')
+                        ].map(normalize).join(' ');
+                        const hasChargeLanguage = /trial|buy|purchase|subscribe|payment|checkout|price|coursera plus|view plans|upgrade/.test(label);
+                        const isLegacyEnrollButton =
+                            /enroll(?:[\s_-]?button)/i.test(attributes) &&
+                            /enroll|join/.test(label);
+                        return !hasChargeLanguage &&
+                            (freeEnrollmentLabels.has(label) || isLegacyEnrollButton);
+                    });
+                    if (enrollmentCandidates.length === 1) {
+                        const candidate = enrollmentCandidates[0];
+                        candidate.click();
+                        return JSON.stringify({
+                            State: 'ENROLL_CLICKED',
+                            Href: null,
+                            Label: accessibleText(candidate)
+                        });
+                    }
+                    if (enrollmentCandidates.length > 1) {
+                        return JSON.stringify({ State: 'ENROLL_AMBIGUOUS', Href: null, Label: null });
+                    }
+                    const hasPaidControl = controls.some(control => {
+                        const label = accessibleText(control);
+                        return paidOrTrialLabels.has(label) ||
+                            /(?:get|try|join|upgrade(?:\s+to)?|subscribe(?:\s+to)?)\s+(?:coursera\s+)?plus\b/.test(label) ||
+                            /\b(?:view|see|choose)\s+(?:a\s+)?plans?\b/.test(label);
+                    });
+                    const pageText = normalize(document.body?.innerText || '');
+                    const hasPlusGateText = /\bcoursera plus\b/.test(pageText) &&
+                        /\b(?:upgrade|subscribe|subscription|trial|plan|purchase|required|access)\b/.test(pageText);
+                    if (hasPaidControl || hasPlusGateText) {
+                        return JSON.stringify({ State: 'PAID_OR_TRIAL', Href: null, Label: null });
+                    }
+                    if (controls.some(control => /\benroll\b|\bjoin\b/.test(accessibleText(control)))) {
+                        return JSON.stringify({ State: 'NOT_ENROLLED', Href: null, Label: null });
+                    }
+                    return JSON.stringify({ State: 'NOT_FOUND', Href: null, Label: null });
+                })();
+                """;
+
+            for (int attempt = 1; attempt <= 12; attempt++)
+            {
+                if (!IsSameCourseraDocument(landingUri))
+                {
+                    return;
+                }
+
+                string script = probeTemplate.Replace(
+                    "__EXPECTED_URL_JSON__",
+                    JsonSerializer.Serialize(landingUri!.ToString()),
+                    StringComparison.Ordinal);
+                string raw = await MainWebView.ExecuteScriptAsync(script);
+                string decoded = DecodeWebViewString(raw);
+                CourseLandingProbe? probe = null;
+                try
+                {
+                    probe = JsonSerializer.Deserialize<CourseLandingProbe>(decoded);
+                }
+                catch
+                {
+                    // React may still be hydrating; retry below while the document stays stable.
+                }
+
+                switch (probe?.State)
+                {
+                    case "STALE_DOCUMENT":
+                        return;
+
+                    case "OPEN_HREF":
+                        if (!TryResolveTrustedCourseEntryUri(landingUri, probe.Href, out Uri? entryUri) ||
+                            entryUri == null)
+                        {
+                            await PauseCourseJobAsync(
+                                "⏸️ Nút vào khóa học dẫn tới route không xác định; Worker đã tạm dừng.",
+                                "Hãy mở profile và vào đúng khóa học trước khi bấm Tiếp tục.",
+                                "COURSE_ENTRY_MISMATCH");
+                            return;
+                        }
+
+                        _viewModel.StatusText = "✅ Đã tìm thấy nút vào khóa học. Đang mở nội dung học...";
+                        MainWebView.Source = entryUri;
+                        return;
+
+                    case "CLICKED":
+                        _viewModel.StatusText = "✅ Đã bấm nút vào khóa học. Đang chờ Coursera chuyển trang...";
+                        if (await WaitForAppItemNavigationAsync(landingUri, TimeSpan.FromSeconds(5)) ||
+                            !IsSameCourseraDocument(landingUri))
+                        {
+                            return;
+                        }
+
+                        // A recognized entry button occasionally has a React handler that
+                        // renders without navigating. The canonical home route is a safe,
+                        // same-course fallback and avoids leaving the worker stuck here.
+                        MainWebView.Source = courseHomeUri;
+                        _viewModel.StatusText = "⏭️ Nút vào khóa học không tự chuyển trang; đang mở khu vực học...";
+                        return;
+
+                    case "ENROLL_CLICKED":
+                        _viewModel.StatusText = "✅ Đang đăng ký khóa học miễn phí. Đang chờ Coursera xác nhận...";
+                        if (await WaitForAppItemNavigationAsync(landingUri, TimeSpan.FromSeconds(7)) ||
+                            !IsSameCourseraDocument(landingUri))
+                        {
+                            return;
+                        }
+
+                        _viewModel.StatusText =
+                            "⏸️ Coursera đang chờ xác nhận đăng ký thủ công.";
+                        await PauseCourseJobAsync(
+                            _viewModel.StatusText,
+                            "Hãy mở profile, hoàn tất bước đăng ký khóa học và đóng profile, sau đó bấm Tiếp tục.",
+                            "COURSE_ENROLLMENT_CONFIRMATION_REQUIRED");
+                        return;
+
+                    case "NOT_ENROLLED":
+                        await PauseCourseJobAsync(
+                            "⏸️ Khóa học yêu cầu đăng ký hoặc quyền truy cập thủ công.",
+                            "Hãy mở profile và đăng ký đúng khóa. Worker sẽ không tự chọn Trial, gói trả phí hoặc thanh toán.",
+                            "COURSE_ENROLLMENT_REQUIRED");
+                        return;
+
+                    case "PAID_OR_TRIAL":
+                        await PauseCourseJobAsync(
+                            "⏸️ Tài khoản chưa có quyền vào khóa; Coursera đang yêu cầu Plus/Trial/gói trả phí.",
+                            "Tài khoản cần Coursera Plus hoặc quyền truy cập phù hợp. Hãy nâng cấp trong profile rồi bấm Tiếp tục.",
+                            "COURSERA_PLUS_REQUIRED");
+                        return;
+
+                    case "ENROLL_AMBIGUOUS":
+                        await PauseCourseJobAsync(
+                            "⏸️ Có nhiều lựa chọn đăng ký; Worker đã tạm dừng để tránh chọn nhầm.",
+                            "Hãy mở profile, chọn đúng phương án đăng ký rồi bấm Tiếp tục.",
+                            "COURSE_ENROLLMENT_AMBIGUOUS");
+                        return;
+
+                    case "AMBIGUOUS":
+                        await PauseCourseJobAsync(
+                            "⏸️ Có nhiều nút vào khóa học; Worker đã tạm dừng để tránh bấm nhầm.",
+                            "Hãy mở profile, vào đúng nội dung khóa học rồi bấm Tiếp tục.",
+                            "COURSE_ENTRY_AMBIGUOUS");
+                        return;
+                }
+
+                if (attempt < 12)
+                {
+                    await Task.Delay(500);
+                }
+            }
+
+            if (!IsSameCourseraDocument(landingUri))
+            {
+                return;
+            }
+
+            if (_courseLandingFallbackCount >= 1)
+            {
+                await PauseCourseJobAsync(
+                    "⏸️ Coursera không hiển thị lối vào nội dung sau các lần thử giới hạn.",
+                    "Hãy mở profile, kiểm tra đăng ký/Coursera Plus và vào khóa thủ công rồi bấm Tiếp tục.",
+                    "COURSE_ENTRY_NOT_FOUND");
+                return;
+            }
+
+            // Try the canonical course home once. If Coursera routes the account
+            // back to the same gate, the bounded counter above pauses instead of
+            // creating a landing -> home -> landing loop.
+            _courseLandingFallbackCount++;
+            MainWebView.Source = courseHomeUri;
+            _viewModel.StatusText =
+                "⏭️ Không thấy nút vào khóa học sau khi chờ tải giao diện; đang mở khu vực học của khóa này...";
         }
         catch (Exception ex)
         {
-            _viewModel.StatusText = "Lỗi xử lý tự động: " + ex.Message;
+            await PauseCourseJobAsync(
+                "⏸️ Không thể xác minh lối vào khóa học; Worker đã tạm dừng.",
+                "Hãy mở profile, kiểm tra quyền truy cập khóa học rồi bấm Tiếp tục. Chi tiết: " + ex.Message,
+                "COURSE_ENTRY_CHECK_FAILED");
         }
+        finally
+        {
+            _isHandlingCourseLanding = false;
+        }
+    }
+
+    private static bool TryResolveTrustedCourseEntryUri(
+        Uri landingUri,
+        string? rawHref,
+        out Uri? entryUri)
+    {
+        entryUri = null;
+        if (string.IsNullOrWhiteSpace(rawHref) ||
+            !Uri.TryCreate(landingUri, rawHref, out Uri? candidate) ||
+            !IsCourseraUri(candidate) ||
+            !TryGetCourseSlug(landingUri, out string landingCourseSlug) ||
+            !TryGetCourseSlug(candidate, out string candidateCourseSlug) ||
+            !string.Equals(landingCourseSlug, candidateCourseSlug, StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        entryUri = candidate;
+        return true;
     }
 
     private async Task CheckModulesAsync()
     {
-        _viewModel.StatusText = "🔍 Đang thanh tra tiến độ các Module...";
-        await Task.Delay(5000); // Chờ sidebar của React render xong
-        string jsCode = @"
-            (function() {
-                // Hỗ trợ cả DOM cũ (data-testid nằm trên <a>) và DOM Coursera hiện tại
-                // (data-testid nằm ở phần tử cha, còn <a> mang aria-label/aria-current).
-                var modules = Array.from(document.querySelectorAll(
-                    'a[data-testid=""rc-WeekNavigationItem""], ' +
-                    '[data-testid=""rc-WeekNavigationItem""] a, ' +
-                    'a[aria-label^=""Module ""]'
-                ));
+        // Course Home raises NavigationCompleted again every time the scanner
+        // changes Module. Keep one sweep in charge until it either opens a
+        // lesson or reaches a terminal completion state.
+        if (_isScanningCourseOutline)
+        {
+            return;
+        }
 
-                // Không được coi danh sách rỗng là đã hoàn thành toàn bộ.
-                if (modules.length === 0) {
-                    return '⚠️ Không tìm thấy danh sách Module. Coursera có thể đã thay đổi giao diện.';
-                }
-                
-                for (var i = 0; i < modules.length; i++) {
-                    var ariaLabel = modules[i].getAttribute('aria-label') || '';
-                    var moduleName = modules[i].innerText.trim();
-                    var isCompleted = /\bComplete(?:d)?\b/i.test(ariaLabel);
-                    var isSelected = modules[i].getAttribute('aria-current') === 'page'
-                        || modules[i].getAttribute('aria-selected') === 'true'
-                        || /\bselected\b/i.test(ariaLabel);
-                    
-                    // Nếu Module này CHƯA hoàn thành
-                    if (!isCompleted) {
-                        
-                        // Nếu Module này chưa được click (chưa được chọn) -> Ép click chuyển về nó!
-                        if (!isSelected) {
-                            modules[i].click();
-                            return '⚠️ Phát hiện ' + moduleName + ' chưa học! Đã chuyển hướng về đó...';
-                        }
-                        
-                        // Nếu đang ở đúng Module chưa học này rồi thì thôi
-                        return '👉 Đang học đúng tiến độ tại: ' + moduleName;
-                    }
-                }
-                return '🏆 Tuyệt vời! Đã hoàn thành toàn bộ các Module!';
-            })();
-        ";
+        _isScanningCourseOutline = true;
         try
         {
-            string result = await MainWebView.ExecuteScriptAsync(jsCode);
-            if (result != null)
+            _viewModel.StatusText = "🔍 Đang thanh tra tiến độ các Module...";
+            await Task.Delay(5000); // Chờ sidebar của React render xong
+
+            string automationCompletedModulesJson = JsonSerializer.Serialize(
+                _automationCompletedModuleNumbers.ToArray());
+            string jsCode = @"
+                (function() {
+                    var automationCompletedModules = new Set(__AUTOMATION_COMPLETED_MODULES__);
+                    var normalizePath = function(value) {
+                        var path = String(value || '').replace(/\/+$/, '');
+                        return path || '/';
+                    };
+                    // Hỗ trợ cả DOM cũ (data-testid nằm trên <a>) và DOM Coursera hiện tại
+                    // (data-testid nằm ở phần tử cha, còn <a> mang aria-label/aria-current).
+                    var modules = Array.from(document.querySelectorAll(
+                        'a[data-testid=""rc-WeekNavigationItem""], ' +
+                        '[data-testid=""rc-WeekNavigationItem""] a, ' +
+                        'a[aria-label^=""Module ""]'
+                    )).filter(function(module, index, allModules) {
+                        return allModules.indexOf(module) === index;
+                    });
+
+                    // Không được coi danh sách rỗng là đã hoàn thành toàn bộ.
+                    if (modules.length === 0) {
+                        var normalize = function(value) {
+                            return String(value || '').replace(/\u00a0/g, ' ')
+                                .replace(/\s+/g, ' ').trim().toLowerCase();
+                        };
+                        var isVisible = function(element) {
+                            if (!(element instanceof HTMLElement) ||
+                                element.matches('[disabled], [aria-disabled=""true""]')) return false;
+                            var style = window.getComputedStyle(element);
+                            var rect = element.getBoundingClientRect();
+                            return style.display !== 'none' && style.visibility !== 'hidden' &&
+                                Number(style.opacity || '1') > 0 && rect.width > 0 && rect.height > 0;
+                        };
+                        var controls = Array.from(document.querySelectorAll('a, button, [role=""button""]'))
+                            .filter(isVisible);
+                        var labels = controls.map(function(control) {
+                            return normalize(control.getAttribute('aria-label') ||
+                                control.getAttribute('title') || control.innerText || control.textContent);
+                        });
+                        var pageText = normalize(document.body ? document.body.innerText : '');
+                        var hasPaidControl = labels.some(function(label) {
+                            return /coursera\s+plus|start\s+(?:a\s+)?free\s+trial|subscribe|subscription|upgrade|view\s+plans?|choose\s+(?:a\s+)?plans?|purchase|buy\s+now|nâng\s+cấp|dùng\s+thử|xem\s+gói|thanh\s+toán/.test(label);
+                        });
+                        var hasPlusGateText = /coursera\s+plus/.test(pageText) &&
+                            /required|access|upgrade|subscribe|subscription|trial|plan|purchase|cần|yêu\s+cầu|nâng\s+cấp|gói|quyền\s+truy\s+cập/.test(pageText);
+                        if (hasPaidControl || hasPlusGateText) {
+                            return 'ACCESS_REQUIRES_SUBSCRIPTION';
+                        }
+                        if (labels.some(function(label) {
+                            return /^(?:enroll|enroll\s+for\s+free|join\s+for\s+free|[đd]ăng\s+ký)(?:\b|$)/.test(label);
+                        })) {
+                            return 'ACCESS_REQUIRES_ENROLLMENT';
+                        }
+                        return 'MODULES_NOT_FOUND';
+                    }
+
+                    var currentPath = normalizePath(window.location.pathname);
+                    var moduleNumber = function(module, index) {
+                        var label = module.getAttribute('aria-label') || module.innerText || '';
+                        var labelMatch = label.match(/^\s*Module\s+(\d+)\b/i);
+                        if (labelMatch) return Number(labelMatch[1]);
+                        try {
+                            var pathMatch = new URL(
+                                module.getAttribute('href') || '',
+                                window.location.href).pathname.match(/\/home\/(?:week|module)\/(\d+)/i);
+                            if (pathMatch) return Number(pathMatch[1]);
+                        } catch (_) { }
+                        return index + 1;
+                    };
+                    var isSelectedModule = function(module) {
+                        var ariaLabel = module.getAttribute('aria-label') || '';
+                        var selectedByPath = false;
+                        try {
+                            selectedByPath = normalizePath(new URL(
+                                module.getAttribute('href') || '',
+                                window.location.href).pathname) === currentPath;
+                        } catch (_) { }
+                        return module.getAttribute('aria-current') === 'page'
+                            || module.getAttribute('aria-selected') === 'true'
+                            || module.getAttribute('aria-expanded') === 'true'
+                            || /\bselected\b/i.test(ariaLabel)
+                            || selectedByPath;
+                    };
+
+                    for (var i = 0; i < modules.length; i++) {
+                        var ariaLabel = modules[i].getAttribute('aria-label') || '';
+                        var moduleName = (modules[i].innerText || '').trim() || ('Module ' + (i + 1));
+                        var number = moduleNumber(modules[i], i);
+                        var isCompleted = /\bComplete(?:d)?\b/i.test(ariaLabel)
+                            || automationCompletedModules.has(number);
+                        var isSelected = isSelectedModule(modules[i]);
+
+                        if (!isCompleted) {
+                            if (!isSelected) {
+                                modules[i].click();
+                                return 'MODULE_CLICKED|' + number + '|' + moduleName;
+                            }
+
+                            return 'MODULE_SELECTED|' + number + '|' + moduleName;
+                        }
+                    }
+                    return '🏆 Tuyệt vời! Đã hoàn thành toàn bộ các Module!';
+                })();
+            ".Replace(
+                "__AUTOMATION_COMPLETED_MODULES__",
+                automationCompletedModulesJson);
+
+            for (int moduleClickAttempt = 1; moduleClickAttempt <= 3; moduleClickAttempt++)
             {
-                string status = result.Trim('"');
+                Uri? beforeModuleClickUri = MainWebView.Source;
+                string result = await MainWebView.ExecuteScriptAsync(jsCode);
+                if (result == null)
+                {
+                    continue;
+                }
+
+                string status = DecodeWebViewString(result);
+                if (string.Equals(status, "ACCESS_REQUIRES_SUBSCRIPTION", StringComparison.Ordinal))
+                {
+                    await PauseCourseJobAsync(
+                        "⏸️ Tài khoản chưa có quyền vào nội dung; Coursera đang yêu cầu Plus/Trial/gói trả phí.",
+                        "Tài khoản cần Coursera Plus hoặc quyền truy cập phù hợp. Hãy nâng cấp trong profile rồi bấm Tiếp tục.",
+                        "COURSERA_PLUS_REQUIRED");
+                    return;
+                }
+
+                if (string.Equals(status, "ACCESS_REQUIRES_ENROLLMENT", StringComparison.Ordinal))
+                {
+                    await PauseCourseJobAsync(
+                        "⏸️ Khóa học chưa được đăng ký hoặc cần xác nhận quyền truy cập.",
+                        "Hãy mở profile, hoàn tất đăng ký đúng khóa rồi bấm Tiếp tục.",
+                        "COURSE_ENROLLMENT_REQUIRED");
+                    return;
+                }
+
+                if (string.Equals(status, "MODULES_NOT_FOUND", StringComparison.Ordinal))
+                {
+                    if (moduleClickAttempt < 3)
+                    {
+                        _viewModel.StatusText =
+                            $"⏳ Chưa thấy danh sách Module; đang chờ Coursera render lại ({moduleClickAttempt}/3)...";
+                        await Task.Delay(1500);
+                        continue;
+                    }
+
+                    await PauseCourseJobAsync(
+                        "⏸️ Không tìm thấy nội dung khóa học sau 3 lần kiểm tra; Worker đã tạm dừng.",
+                        "Hãy mở profile, kiểm tra đăng ký/Coursera Plus và vào đúng trang nội dung rồi bấm Tiếp tục.",
+                        "COURSE_CONTENT_UNAVAILABLE");
+                    return;
+                }
+
+                if (status.StartsWith("MODULE_CLICKED|", StringComparison.Ordinal))
+                {
+                    string[] parts = status.Split('|', 3);
+                    string moduleName = parts.Length == 3 ? parts[2] : "Module chưa hoàn thành";
+                    _viewModel.StatusText =
+                        $"➡️ Đang chuyển sang {moduleName} ({moduleClickAttempt}/3)...";
+                    if (beforeModuleClickUri != null &&
+                        await WaitForAppItemNavigationAsync(
+                            beforeModuleClickUri,
+                            TimeSpan.FromSeconds(5)))
+                    {
+                        await Task.Delay(2000);
+                        await CheckLessonsAsync();
+                        return;
+                    }
+
+                    if (moduleClickAttempt < 3)
+                    {
+                        _viewModel.StatusText =
+                            $"⚠️ Coursera chưa chuyển sang {moduleName}; đang thử lại ({moduleClickAttempt}/3)...";
+                        await Task.Delay(1000);
+                        continue;
+                    }
+
+                    await FailCourseJobAsync(
+                        $"❌ Không thể chuyển sang {moduleName} sau 3 lần; Worker đã dừng để tránh lặp vô hạn.");
+                    return;
+                }
+
+                if (status.StartsWith("MODULE_SELECTED|", StringComparison.Ordinal))
+                {
+                    string[] parts = status.Split('|', 3);
+                    string moduleName = parts.Length == 3 ? parts[2] : "Module hiện tại";
+                    status = "👉 Đang học đúng tiến độ tại: " + moduleName;
+                }
                 _viewModel.StatusText = status;
 
                 if (status.Contains("🏆", StringComparison.Ordinal))
@@ -2197,20 +3545,33 @@ public partial class MainWindow : Window
                     return;
                 }
                 
-                if (!result.Contains("🏆") && !result.Contains("Không tìm thấy danh sách Module"))
+                if (!status.Contains("🏆", StringComparison.Ordinal))
                 {
                     await Task.Delay(3000); // Đợi React render danh sách bài học
                     await CheckLessonsAsync();
                 }
+                return;
             }
+
+            await FailCourseJobAsync(
+                "❌ Không đọc được trạng thái Module sau 3 lần; Worker đã dừng để tránh lặp vô hạn.");
         }
         catch (Exception ex)
         {
-            _viewModel.StatusText = "Lỗi thanh tra Module: " + ex.Message;
+            await PauseCourseJobAsync(
+                "⏸️ Không đọc được danh sách Module; Worker đã tạm dừng.",
+                "Hãy mở profile, kiểm tra nội dung khóa học rồi bấm Tiếp tục. Chi tiết: " + ex.Message,
+                "COURSE_OUTLINE_CHECK_FAILED");
+        }
+        finally
+        {
+            _isScanningCourseOutline = false;
         }
     }
 
-    private async Task CheckLessonsAsync()
+    private async Task CheckLessonsAsync(
+        int moduleNavigationAttempt = 0,
+        int lessonHydrationAttempt = 0)
     {
         _viewModel.StatusText = "🔎 Đang dọn dẹp màn hình và quét bài chưa học...";
         await Task.Delay(2000);
@@ -2219,10 +3580,31 @@ public partial class MainWindow : Window
         await DismissAnyGlobalPopupsAsync();
         await Task.Delay(1000);
 
+        // Snapshot before embedding in the page script.  A pending assessment
+        // remains visibly incomplete in Coursera's sidebar, so it must be
+        // excluded explicitly rather than treated as a fresh quiz.
+        string pendingResultPathsJson = JsonSerializer.Serialize(
+            _pendingGradedResultPaths.ToArray());
+        string submittedDiscussionPathsJson = JsonSerializer.Serialize(
+            _submittedDiscussionPaths.ToArray());
+        string skippedLaunchAppItemPathsJson = JsonSerializer.Serialize(
+            _skippedLaunchAppItemPaths.ToArray());
+        string automationCompletedModulesJson = JsonSerializer.Serialize(
+            _automationCompletedModuleNumbers.ToArray());
+
         string jsCode = @"
             (function() {
                 var skipGradedAppItems = __SKIP_GRADED__;
                 var skipPracticeAppItems = __SKIP_PRACTICE__;
+                var skipPeerItems = __SKIP_PEER__;
+                var pendingResultPaths = new Set(__PENDING_RESULT_PATHS__);
+                var submittedDiscussionPaths = new Set(__SUBMITTED_DISCUSSION_PATHS__);
+                var skippedLaunchAppItemPaths = new Set(__SKIPPED_LAUNCH_APP_PATHS__);
+                var automationCompletedModules = new Set(__AUTOMATION_COMPLETED_MODULES__);
+                var normalizePath = function(value) {
+                    var path = String(value || '').replace(/\/+$/, '');
+                    return path || '/';
+                };
                 // Hỗ trợ cả link bài học DOM cũ và cấu trúc WeekSingleItemDisplay hiện tại.
                 var lessons = Array.from(document.querySelectorAll(
                     'a[data-click-key=""open_course_home.period_page.click.item_link""], ' +
@@ -2231,22 +3613,90 @@ public partial class MainWindow : Window
 
                 // Danh sách rỗng là lỗi nhận diện, không phải đã hoàn thành.
                 if (lessons.length === 0) {
-                    return '⚠️ Không tìm thấy danh sách bài học trong Module hiện tại.';
+                    var normalize = function(value) {
+                        return String(value || '').replace(/\u00a0/g, ' ')
+                            .replace(/\s+/g, ' ').trim().toLowerCase();
+                    };
+                    var isVisible = function(element) {
+                        if (!(element instanceof HTMLElement) ||
+                            element.matches('[disabled], [aria-disabled=""true""]')) return false;
+                        var style = window.getComputedStyle(element);
+                        var rect = element.getBoundingClientRect();
+                        return style.display !== 'none' && style.visibility !== 'hidden' &&
+                            Number(style.opacity || '1') > 0 && rect.width > 0 && rect.height > 0;
+                    };
+                    var labels = Array.from(document.querySelectorAll('a, button, [role=""button""]'))
+                        .filter(isVisible)
+                        .map(function(control) {
+                            return normalize(control.getAttribute('aria-label') ||
+                                control.getAttribute('title') || control.innerText || control.textContent);
+                        });
+                    var pageText = normalize(document.body ? document.body.innerText : '');
+                    var hasPaidControl = labels.some(function(label) {
+                        return /coursera\s+plus|start\s+(?:a\s+)?free\s+trial|subscribe|subscription|upgrade|view\s+plans?|choose\s+(?:a\s+)?plans?|purchase|buy\s+now|nâng\s+cấp|dùng\s+thử|xem\s+gói|thanh\s+toán/.test(label);
+                    });
+                    var hasPlusGateText = /coursera\s+plus/.test(pageText) &&
+                        /required|access|upgrade|subscribe|subscription|trial|plan|purchase|cần|yêu\s+cầu|nâng\s+cấp|gói|quyền\s+truy\s+cập/.test(pageText);
+                    if (hasPaidControl || hasPlusGateText) {
+                        return 'ACCESS_REQUIRES_SUBSCRIPTION';
+                    }
+                    if (labels.some(function(label) {
+                        return /^(?:enroll|enroll\s+for\s+free|join\s+for\s+free|[đd]ăng\s+ký)(?:\b|$)/.test(label);
+                    })) {
+                        return 'ACCESS_REQUIRES_ENROLLMENT';
+                    }
+                    return 'LESSONS_NOT_FOUND';
                 }
                 
                 var skippedAppItems = 0;
+                var skippedPeerItems = 0;
+                var skippedPendingResults = 0;
+                var skippedSubmittedDiscussions = 0;
                 for (var i = 0; i < lessons.length; i++) {
                     var htmlContent = lessons[i].innerHTML;
                     var ariaLabel = lessons[i].getAttribute('aria-label') || '';
-                    var itemText = (ariaLabel + ' ' + (lessons[i].innerText || '')).trim();
+                    var href = lessons[i].getAttribute('href') || '';
+                    var itemText = (ariaLabel + ' ' + (lessons[i].innerText || ''))
+                        .replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
+
+                    // Coursera keeps an accepted-but-ungraded assessment marked
+                    // incomplete.  Compare canonical paths so query parameters
+                    // or tracking fragments cannot make the scanner reopen it.
+                    var lessonPath = '';
+                    try {
+                        lessonPath = normalizePath(
+                            new URL(href, window.location.href).pathname);
+                    } catch (_) { }
+                    if (lessonPath && skippedLaunchAppItemPaths.has(lessonPath)) {
+                        skippedAppItems++;
+                        continue;
+                    }
+                    if (lessonPath && pendingResultPaths.has(lessonPath)) {
+                        skippedPendingResults++;
+                        continue;
+                    }
+                    if (lessonPath && submittedDiscussionPaths.has(lessonPath)) {
+                        skippedSubmittedDiscussions++;
+                        continue;
+                    }
 
                     // Graded/Practice App Item đang được cấu hình bỏ qua: không mở,
                     // không Launch App và tiếp tục tìm bài có thể tự động hóa tiếp theo.
-                    var isGradedAppItem = /\bGraded App Item\b/i.test(itemText);
-                    var isPracticeAppItem = /\bPractice App Item\b/i.test(itemText);
+                    var isGradedAppItem = /\bGraded\s+App\s+Item\b/i.test(itemText);
+                    var isPracticeAppItem = /\b(?:Practice|Ungraded)\s+App\s+Item\b/i.test(itemText);
                     if ((skipGradedAppItems && isGradedAppItem) ||
                         (skipPracticeAppItems && isPracticeAppItem)) {
                         skippedAppItems++;
+                        continue;
+                    }
+
+                    // Peer-graded assignments and peer reviews stay pending for
+                    // the learner. Do not open them; keep scanning for another
+                    // supported lesson in the current module.
+                    var isPeerItem = /\/peer(?:\/|$)/i.test(href) ||
+                        /\bpeer[-\s]?(?:graded|review(?:ed)?)\b|\bpeer\s+(?:assessment|assignment)\b/i.test(itemText);
+                    if (skipPeerItems && isPeerItem) {
+                        skippedPeerItems++;
                         continue;
                     }
 
@@ -2265,9 +3715,20 @@ public partial class MainWindow : Window
                             : (ariaLabel || 'bài mới');
                         
                         lessons[i].click();
-                        return (skippedAppItems > 0
-                            ? '⏭️ Đã bỏ qua App Item. Đang tiến vào học bài: '
-                            : '👉 Đang tiến vào học bài: ') + lessonName;
+                        var skippedPrefix = skippedPendingResults > 0 && skippedSubmittedDiscussions > 0
+                            ? '⏭️ Đã bỏ qua bài chờ chấm điểm và thảo luận đã gửi. Đang tiến vào học bài: '
+                            : skippedPendingResults > 0
+                            ? '⏭️ Đã bỏ qua bài đang chờ chấm điểm. Đang tiến vào học bài: '
+                            : skippedSubmittedDiscussions > 0
+                                ? '⏭️ Đã bỏ qua bài thảo luận đã gửi. Đang tiến vào học bài: '
+                                : skippedPeerItems > 0 && skippedAppItems > 0
+                                ? '⏭️ Đã bỏ qua Peer/Review và App Item. Đang tiến vào học bài: '
+                                : skippedPeerItems > 0
+                                    ? '⏭️ Đã bỏ qua Peer/Review. Đang tiến vào học bài: '
+                                    : skippedAppItems > 0
+                                        ? '⏭️ Đã bỏ qua App Item. Đang tiến vào học bài: '
+                                        : '👉 Đang tiến vào học bài: ';
+                        return skippedPrefix + lessonName;
                     }
                 }
                 
@@ -2283,57 +3744,235 @@ public partial class MainWindow : Window
                     return /^Module\s+\d+\b/i.test(moduleText)
                         && allModules.indexOf(module) === index;
                 });
+                var currentPath = normalizePath(window.location.pathname);
+                var moduleNumber = function(module, index) {
+                    var label = module.getAttribute('aria-label') || module.innerText || '';
+                    var labelMatch = label.match(/^\s*Module\s+(\d+)\b/i);
+                    if (labelMatch) return Number(labelMatch[1]);
+                    try {
+                        var pathMatch = new URL(
+                            module.getAttribute('href') || '',
+                            window.location.href).pathname.match(/\/home\/(?:week|module)\/(\d+)/i);
+                        if (pathMatch) return Number(pathMatch[1]);
+                    } catch (_) { }
+                    return index + 1;
+                };
                 var selectedIndex = modules.findIndex(function(module) {
                     var moduleLabel = module.getAttribute('aria-label') || '';
+                    var selectedByPath = false;
+                    try {
+                        selectedByPath = normalizePath(new URL(
+                            module.getAttribute('href') || '',
+                            window.location.href).pathname) === currentPath;
+                    } catch (_) { }
                     return module.getAttribute('aria-current') === 'page'
                         || module.getAttribute('aria-selected') === 'true'
                         || module.getAttribute('aria-expanded') === 'true'
-                        || /\bselected\b/i.test(moduleLabel);
+                        || /\bselected\b/i.test(moduleLabel)
+                        || selectedByPath;
                 });
-                if (selectedIndex >= 0 && selectedIndex + 1 < modules.length) {
-                    var nextModule = modules[selectedIndex + 1];
-                    var nextName = nextModule.innerText.trim() || ('Module ' + (selectedIndex + 2));
-                    nextModule.click();
-                    return (skippedAppItems > 0
-                        ? 'SKIPPED_APP_NEXT_MODULE|'
-                        : 'NEXT_MODULE|') + nextName;
+                if (selectedIndex < 0) {
+                    var pathMatch = currentPath.match(/\/home\/(?:week|module)\/(\d+)/i);
+                    if (pathMatch) {
+                        var currentNumberFromPath = Number(pathMatch[1]);
+                        selectedIndex = modules.findIndex(function(module, index) {
+                            return moduleNumber(module, index) === currentNumberFromPath;
+                        });
+                    }
                 }
-                if (selectedIndex === modules.length - 1 && modules.length > 0) {
-                    return skippedAppItems > 0
+                if (selectedIndex < 0 || modules.length === 0) {
+                    return '⚠️ Module hiện tại đã hoàn thành nhưng không xác định được Module tiếp theo.';
+                }
+
+                var currentModuleNumber = moduleNumber(modules[selectedIndex], selectedIndex);
+                automationCompletedModules.add(currentModuleNumber);
+                var moduleIsEffectivelyCompleted = function(module, index) {
+                    var moduleLabel = (module.getAttribute('aria-label') || module.innerText || '').trim();
+                    return /\bComplete(?:d)?\b/i.test(moduleLabel)
+                        || automationCompletedModules.has(moduleNumber(module, index));
+                };
+                var nextIndex = -1;
+                for (var candidateIndex = selectedIndex + 1;
+                    candidateIndex < modules.length;
+                    candidateIndex++) {
+                    if (!moduleIsEffectivelyCompleted(modules[candidateIndex], candidateIndex)) {
+                        nextIndex = candidateIndex;
+                        break;
+                    }
+                }
+                if (nextIndex < 0) {
+                    for (var earlierIndex = 0; earlierIndex < selectedIndex; earlierIndex++) {
+                        if (!moduleIsEffectivelyCompleted(modules[earlierIndex], earlierIndex)) {
+                            nextIndex = earlierIndex;
+                            break;
+                        }
+                    }
+                }
+
+                if (nextIndex >= 0) {
+                    var nextModule = modules[nextIndex];
+                    var nextName = (nextModule.innerText || '').trim() || ('Module ' + (nextIndex + 1));
+                    nextModule.click();
+                    var nextModulePrefix = skippedPeerItems > 0 && skippedAppItems > 0
+                        ? 'SKIPPED_PEER_APP_NEXT_MODULE|'
+                        : skippedPeerItems > 0
+                            ? 'SKIPPED_PEER_NEXT_MODULE|'
+                            : skippedAppItems > 0
+                                ? 'SKIPPED_APP_NEXT_MODULE|'
+                                : 'NEXT_MODULE|';
+                    return 'MODULE_SCANNED|' + currentModuleNumber + '|' +
+                        nextModulePrefix + nextName;
+                }
+
+                var completionStatus;
+                if (skippedSubmittedDiscussions > 0) {
+                    var remainingItems = ['phản hồi Discussion đã gửi'];
+                    if (skippedPendingResults > 0) remainingItems.push('bài đang chờ chấm điểm');
+                    if (skippedPeerItems > 0) remainingItems.push('Peer/Review đã bỏ qua');
+                    if (skippedAppItems > 0) remainingItems.push('App Item đã bỏ qua');
+                    completionStatus = '🏆 Đã hoàn tất các bài tự động; còn ' + remainingItems.join(', ') + '.';
+                } else if (skippedPendingResults > 0 && skippedPeerItems > 0 && skippedAppItems > 0) {
+                    completionStatus = '🏆 Đã hoàn tất các bài tự động; còn bài chờ chấm điểm, Peer/Review và App Item đã bỏ qua.';
+                } else if (skippedPendingResults > 0 && skippedPeerItems > 0) {
+                    completionStatus = '🏆 Đã hoàn tất các bài tự động; còn bài chờ chấm điểm và Peer/Review đã bỏ qua.';
+                } else if (skippedPendingResults > 0 && skippedAppItems > 0) {
+                    completionStatus = '🏆 Đã hoàn tất các bài tự động; còn bài chờ chấm điểm và App Item đã bỏ qua.';
+                } else if (skippedPendingResults > 0) {
+                    completionStatus = '🏆 Đã hoàn tất các bài tự động; còn bài đã nộp đang chờ chấm điểm.';
+                } else if (skippedPeerItems > 0 && skippedAppItems > 0) {
+                    completionStatus = '🏆 Đã hoàn tất các bài tự động; còn Peer/Review và App Item đã bỏ qua.';
+                } else if (skippedPeerItems > 0) {
+                    completionStatus = '🏆 Đã hoàn tất các bài tự động; còn Peer/Review đã bỏ qua.';
+                } else {
+                    completionStatus = skippedAppItems > 0
                         ? '🏆 Đã hoàn tất các bài có thể tự động và bỏ qua App Item.'
                         : '🏆 Tuyệt vời! Bạn đã hoàn thành toàn bộ các Module!';
                 }
-                return '⚠️ Module hiện tại đã hoàn thành nhưng không xác định được Module tiếp theo.';
+                return 'MODULE_SCANNED|' + currentModuleNumber + '|' + completionStatus;
             })();
         ";
         jsCode = jsCode
             .Replace("__SKIP_GRADED__", ShouldSkipGradedAppItems ? "true" : "false")
-            .Replace("__SKIP_PRACTICE__", ShouldSkipPracticeAppItems ? "true" : "false");
+            .Replace("__SKIP_PRACTICE__", ShouldSkipPracticeAppItems ? "true" : "false")
+            .Replace("__SKIP_PEER__", ShouldSkipPeerItems ? "true" : "false")
+            .Replace("__PENDING_RESULT_PATHS__", pendingResultPathsJson)
+            .Replace("__SUBMITTED_DISCUSSION_PATHS__", submittedDiscussionPathsJson)
+            .Replace("__SKIPPED_LAUNCH_APP_PATHS__", skippedLaunchAppItemPathsJson)
+            .Replace("__AUTOMATION_COMPLETED_MODULES__", automationCompletedModulesJson);
 
         try
         {
+            Uri? beforeModuleNavigationUri = MainWebView.Source;
             string result = await MainWebView.ExecuteScriptAsync(jsCode);
             if (result != null)
             {
-                string status = result.Trim('"');
+                string status = DecodeWebViewString(result);
+                if (string.Equals(status, "ACCESS_REQUIRES_SUBSCRIPTION", StringComparison.Ordinal))
+                {
+                    await PauseCourseJobAsync(
+                        "⏸️ Tài khoản chưa có quyền mở bài học; Coursera đang yêu cầu Plus/Trial/gói trả phí.",
+                        "Tài khoản cần Coursera Plus hoặc quyền truy cập phù hợp. Hãy nâng cấp trong profile rồi bấm Tiếp tục.",
+                        "COURSERA_PLUS_REQUIRED");
+                    return;
+                }
+
+                if (string.Equals(status, "ACCESS_REQUIRES_ENROLLMENT", StringComparison.Ordinal))
+                {
+                    await PauseCourseJobAsync(
+                        "⏸️ Khóa học chưa được đăng ký hoặc cần xác nhận quyền truy cập.",
+                        "Hãy mở profile, hoàn tất đăng ký đúng khóa rồi bấm Tiếp tục.",
+                        "COURSE_ENROLLMENT_REQUIRED");
+                    return;
+                }
+
+                if (string.Equals(status, "LESSONS_NOT_FOUND", StringComparison.Ordinal))
+                {
+                    if (lessonHydrationAttempt < 2)
+                    {
+                        _viewModel.StatusText =
+                            $"⏳ Chưa thấy danh sách bài; đang chờ Coursera render lại ({lessonHydrationAttempt + 1}/3)...";
+                        await Task.Delay(1500);
+                        await CheckLessonsAsync(moduleNavigationAttempt, lessonHydrationAttempt + 1);
+                        return;
+                    }
+
+                    await PauseCourseJobAsync(
+                        "⏸️ Không tìm thấy danh sách bài học sau 3 lần kiểm tra; Worker đã tạm dừng.",
+                        "Hãy mở profile, kiểm tra quyền truy cập và trang Module hiện tại rồi bấm Tiếp tục.",
+                        "COURSE_LESSONS_UNAVAILABLE");
+                    return;
+                }
+
+                const string moduleScannedPrefix = "MODULE_SCANNED|";
+                if (status.StartsWith(moduleScannedPrefix, StringComparison.Ordinal))
+                {
+                    int moduleNumberEnd = status.IndexOf(
+                        '|',
+                        moduleScannedPrefix.Length);
+                    if (moduleNumberEnd > moduleScannedPrefix.Length &&
+                        int.TryParse(
+                            status[moduleScannedPrefix.Length..moduleNumberEnd],
+                            out int completedModuleNumber))
+                    {
+                        _automationCompletedModuleNumbers.Add(completedModuleNumber);
+                        status = status[(moduleNumberEnd + 1)..];
+                    }
+                }
                 if (status.Contains("Đã bỏ qua App Item", StringComparison.Ordinal) ||
-                    status.Contains("bỏ qua App Item", StringComparison.Ordinal))
+                    status.Contains("bỏ qua App Item", StringComparison.Ordinal) ||
+                    status.StartsWith("SKIPPED_PEER_APP_NEXT_MODULE|", StringComparison.Ordinal))
                 {
                     _courseHasSkippedLaunchAppItems = true;
                 }
-                bool skippedAppItem = status.StartsWith(
-                    "SKIPPED_APP_NEXT_MODULE|", StringComparison.Ordinal);
-                if (status.StartsWith("NEXT_MODULE|", StringComparison.Ordinal) || skippedAppItem)
+
+                bool skippedPeerItem = status.Contains("Peer/Review", StringComparison.Ordinal) ||
+                    status.StartsWith("SKIPPED_PEER_NEXT_MODULE|", StringComparison.Ordinal) ||
+                    status.StartsWith("SKIPPED_PEER_APP_NEXT_MODULE|", StringComparison.Ordinal);
+                if (skippedPeerItem)
                 {
-                    string prefix = skippedAppItem
-                        ? "SKIPPED_APP_NEXT_MODULE|"
-                        : "NEXT_MODULE|";
+                    _courseHasSkippedPeerItems = true;
+                }
+
+                string? prefix = status.StartsWith("SKIPPED_PEER_APP_NEXT_MODULE|", StringComparison.Ordinal)
+                    ? "SKIPPED_PEER_APP_NEXT_MODULE|"
+                    : status.StartsWith("SKIPPED_PEER_NEXT_MODULE|", StringComparison.Ordinal)
+                        ? "SKIPPED_PEER_NEXT_MODULE|"
+                        : status.StartsWith("SKIPPED_APP_NEXT_MODULE|", StringComparison.Ordinal)
+                            ? "SKIPPED_APP_NEXT_MODULE|"
+                            : status.StartsWith("NEXT_MODULE|", StringComparison.Ordinal)
+                                ? "NEXT_MODULE|"
+                                : null;
+                if (prefix != null)
+                {
                     string nextModule = status[prefix.Length..];
-                    _viewModel.StatusText = skippedAppItem
-                        ? "⏭️ Đã bỏ qua App Item. Đang chuyển sang: " + nextModule
-                        : "➡️ Module hiện tại đã xong. Đang chuyển sang: " + nextModule;
-                    await Task.Delay(4000);
-                    await CheckLessonsAsync();
+                    _viewModel.StatusText = prefix == "SKIPPED_PEER_APP_NEXT_MODULE|"
+                        ? "⏭️ Đã bỏ qua Peer/Review và App Item. Đang chuyển sang: " + nextModule
+                        : prefix == "SKIPPED_PEER_NEXT_MODULE|"
+                            ? "⏭️ Đã bỏ qua Peer/Review. Đang chuyển sang: " + nextModule
+                            : prefix == "SKIPPED_APP_NEXT_MODULE|"
+                                ? "⏭️ Đã bỏ qua App Item. Đang chuyển sang: " + nextModule
+                                : "➡️ Module hiện tại đã xong. Đang chuyển sang: " + nextModule;
+                    if (beforeModuleNavigationUri != null &&
+                        await WaitForAppItemNavigationAsync(
+                            beforeModuleNavigationUri,
+                            TimeSpan.FromSeconds(5)))
+                    {
+                        await Task.Delay(2000);
+                        await CheckLessonsAsync();
+                        return;
+                    }
+
+                    if (moduleNavigationAttempt < 2)
+                    {
+                        _viewModel.StatusText =
+                            $"⚠️ Coursera chưa chuyển sang {nextModule}; đang thử lại ({moduleNavigationAttempt + 1}/3)...";
+                        await Task.Delay(1000);
+                        await CheckLessonsAsync(moduleNavigationAttempt + 1, 0);
+                        return;
+                    }
+
+                    await FailCourseJobAsync(
+                        $"❌ Không thể chuyển sang {nextModule} sau 3 lần; Worker đã dừng để tránh lặp vô hạn.");
                     return;
                 }
                 if (status.Contains("🏆", StringComparison.Ordinal))
@@ -2347,14 +3986,23 @@ public partial class MainWindow : Window
         }
         catch (Exception ex)
         {
-            _viewModel.StatusText = "Lỗi thanh tra bài học: " + ex.Message;
+            await PauseCourseJobAsync(
+                "⏸️ Không đọc được danh sách bài học; Worker đã tạm dừng.",
+                "Hãy mở profile, kiểm tra nội dung khóa học rồi bấm Tiếp tục. Chi tiết: " + ex.Message,
+                "COURSE_LESSON_CHECK_FAILED");
         }
     }
 
     private const string JsHandleKnownCourseraPopup = """
         (function() {
             const expectedUrl = __EXPECTED_URL_JSON__;
-            if (location.href !== expectedUrl) return 'STALE_DOCUMENT';
+            const currentUrl = new URL(location.href);
+            const targetUrl = new URL(expectedUrl);
+            if (currentUrl.origin !== targetUrl.origin ||
+                currentUrl.pathname !== targetUrl.pathname ||
+                currentUrl.search !== targetUrl.search) {
+                return 'STALE_DOCUMENT';
+            }
             const normalize = value => String(value || '')
                 .replace(/\u00a0/g, ' ')
                 .replace(/\s+/g, ' ')
@@ -2587,12 +4235,213 @@ public partial class MainWindow : Window
         }
     }
 
+    private const int CourseraSubmitPollMilliseconds = 250;
+    private const int CourseraSubmitPollAttempts = 48;
+
+    // Coursera can keep desktop/mobile/sticky copies of the Submit button in the
+    // DOM.  Do not use querySelector here: it returns the first copy, which can
+    // be hidden and disabled while the real quiz button is visibly ready.
+    private const string JsProbeCourseraPrimarySubmit = """
+        (function() {
+            const expectedUrl = __EXPECTED_URL_JSON__;
+            const clickWhenReady = __CLICK_WHEN_READY__;
+            const currentUrl = new URL(location.href);
+            const targetUrl = new URL(expectedUrl);
+            if (currentUrl.origin !== targetUrl.origin ||
+                currentUrl.pathname !== targetUrl.pathname ||
+                currentUrl.search !== targetUrl.search) {
+                return 'STALE_DOCUMENT';
+            }
+
+            const hasHiddenAncestor = element => {
+                for (let current = element; current && current.nodeType === 1; current = current.parentElement) {
+                    if (current.getAttribute('aria-hidden') === 'true' || current.hasAttribute('inert')) {
+                        return true;
+                    }
+                    const style = window.getComputedStyle(current);
+                    if (!style || style.display === 'none' ||
+                        style.visibility === 'hidden' || style.visibility === 'collapse') {
+                        return true;
+                    }
+                }
+                return false;
+            };
+            const isVisibleButton = button => !!button && button.isConnected &&
+                button.getClientRects().length > 0 && !hasHiddenAncestor(button);
+            const isEnabled = control => !control.disabled &&
+                String(control.getAttribute('aria-disabled') || '').trim().toLowerCase() !== 'true';
+            const isSubmitEnabled = button => isEnabled(button) &&
+                window.getComputedStyle(button).pointerEvents !== 'none';
+
+            // First resolve Honor Code; it scopes the primary submit button to
+            // the active assignment dialog when Coursera has duplicate layouts.
+            const visibleHonorCodes = Array.from(
+                document.querySelectorAll('#agreement-checkbox-base'))
+                .filter(input => input.isConnected && !hasHiddenAncestor(input));
+            if (visibleHonorCodes.length > 1) {
+                return 'HONOR_CONFIRMATION_AMBIGUOUS|visible=' + visibleHonorCodes.length;
+            }
+            const honorCode = visibleHonorCodes.length === 1 ? visibleHonorCodes[0] : null;
+            if (honorCode && !honorCode.checked) {
+                if (!isEnabled(honorCode)) return 'HONOR_CONFIRMATION_BLOCKED';
+                honorCode.click();
+                return 'HONOR_CONFIRMATION_CLICKED';
+            }
+
+            const submitScope = honorCode?.closest(
+                '[role="dialog"],[aria-modal="true"],dialog[open]');
+            const allSubmitButtons = Array.from(
+                document.querySelectorAll('button[data-testid="submit-button"]'))
+                .filter(button => !submitScope || submitScope.contains(button));
+            const visibleSubmitButtons = allSubmitButtons.filter(isVisibleButton);
+            if (allSubmitButtons.length === 0) return 'SUBMIT_NOT_FOUND';
+            if (visibleSubmitButtons.length === 0) {
+                return 'SUBMIT_NOT_VISIBLE|total=' + allSubmitButtons.length;
+            }
+            const enabledSubmitButtons = visibleSubmitButtons.filter(isSubmitEnabled);
+            if (enabledSubmitButtons.length > 1) {
+                return 'SUBMIT_AMBIGUOUS|visible=' + visibleSubmitButtons.length +
+                    '|enabled=' + enabledSubmitButtons.length + '|total=' + allSubmitButtons.length;
+            }
+            if (enabledSubmitButtons.length === 0) {
+                const firstVisibleButton = visibleSubmitButtons[0];
+                if (visibleSubmitButtons.length === 1) {
+                    firstVisibleButton.scrollIntoView({ behavior: 'auto', block: 'center', inline: 'nearest' });
+                }
+                return 'SUBMIT_WAITING|visible=' + visibleSubmitButtons.length + '|total=' + allSubmitButtons.length +
+                    '|enabled=0|disabled=' + (firstVisibleButton.disabled ? '1' : '0') +
+                    '|aria-disabled=' + String(firstVisibleButton.getAttribute('aria-disabled') || 'false');
+            }
+
+            const submitButton = enabledSubmitButtons[0];
+            submitButton.scrollIntoView({ behavior: 'auto', block: 'center', inline: 'nearest' });
+            if (!clickWhenReady) return 'READY';
+            // Re-query/validate on every polling pass, then click only the one
+            // visible and enabled submit control belonging to this document.
+            submitButton.click();
+            return 'CLICKED';
+        })();
+        """;
+
+    private async Task<string> WaitForCourseraPrimarySubmitAsync(bool clickWhenReady)
+    {
+        Uri? capturedUri = MainWebView.Source;
+        if (!IsCourseraUri(capturedUri) || IsCourseraLoginUri(capturedUri))
+        {
+            return "WRONG_PAGE";
+        }
+
+        string expectedUrl = capturedUri!.ToString();
+        string lastStatus = "SUBMIT_WAITING";
+        for (int attempt = 1; attempt <= CourseraSubmitPollAttempts; attempt++)
+        {
+            if (!IsSameCourseraDocument(capturedUri))
+            {
+                return "STALE_DOCUMENT";
+            }
+
+            string script = JsProbeCourseraPrimarySubmit
+                .Replace("__EXPECTED_URL_JSON__", JsonSerializer.Serialize(expectedUrl), StringComparison.Ordinal)
+                .Replace("__CLICK_WHEN_READY__", clickWhenReady ? "true" : "false", StringComparison.Ordinal);
+            string status;
+            try
+            {
+                status = DecodeWebViewString(await MainWebView.ExecuteScriptAsync(script));
+            }
+            catch
+            {
+                return "SUBMIT_SCRIPT_FAILED";
+            }
+
+            if ((!clickWhenReady && status == "READY") ||
+                (clickWhenReady && status == "CLICKED"))
+            {
+                return status;
+            }
+
+            if (IsCourseraSubmitRetryableStatus(status))
+            {
+                lastStatus = status;
+                _viewModel.StatusText = clickWhenReady
+                    ? $"⏳ Coursera đang cập nhật nút Submit trước khi nộp ({attempt}/{CourseraSubmitPollAttempts})..."
+                    : $"⏳ Đang chờ Coursera mở đúng nút Submit ({attempt}/{CourseraSubmitPollAttempts})...";
+                if (attempt < CourseraSubmitPollAttempts)
+                {
+                    await Task.Delay(CourseraSubmitPollMilliseconds);
+                    continue;
+                }
+
+                break;
+            }
+
+            return status;
+        }
+
+        return $"SUBMIT_TIMEOUT|{lastStatus}";
+    }
+
+    private static bool IsCourseraSubmitRetryableStatus(string status) =>
+        status == "HONOR_CONFIRMATION_CLICKED" ||
+        status == "HONOR_CONFIRMATION_BLOCKED" ||
+        status == "SUBMIT_NOT_FOUND" ||
+        status.StartsWith("SUBMIT_WAITING|", StringComparison.Ordinal) ||
+        status.StartsWith("SUBMIT_NOT_VISIBLE|", StringComparison.Ordinal) ||
+        status.StartsWith("SUBMIT_AMBIGUOUS|", StringComparison.Ordinal) ||
+        status.StartsWith("HONOR_CONFIRMATION_AMBIGUOUS|", StringComparison.Ordinal);
+
+    private static string DescribeCourseraSubmitStatus(string status)
+    {
+        if (status.StartsWith("SUBMIT_TIMEOUT|", StringComparison.Ordinal))
+        {
+            string finalStatus = status["SUBMIT_TIMEOUT|".Length..];
+            if (finalStatus == "HONOR_CONFIRMATION_CLICKED" ||
+                finalStatus == "HONOR_CONFIRMATION_BLOCKED" ||
+                finalStatus.StartsWith("HONOR_CONFIRMATION_AMBIGUOUS|", StringComparison.Ordinal))
+            {
+                return "Coursera chưa giữ được xác nhận Honor Code sau 12 giây (" +
+                    DescribeCourseraSubmitStatus(finalStatus) + ")";
+            }
+
+            return "Coursera chưa mở nút Submit sau 12 giây (" +
+                DescribeCourseraSubmitStatus(finalStatus) + ")";
+        }
+
+        if (status.StartsWith("SUBMIT_WAITING|", StringComparison.Ordinal))
+        {
+            return "nút Submit của Coursera vẫn đang khóa (" + status + ")";
+        }
+        if (status.StartsWith("SUBMIT_NOT_VISIBLE|", StringComparison.Ordinal))
+        {
+            return "chưa thấy nút Submit đang hiển thị (" + status + ")";
+        }
+        if (status.StartsWith("SUBMIT_AMBIGUOUS|", StringComparison.Ordinal))
+        {
+            return "Coursera đang hiển thị nhiều nút Submit hợp lệ (" + status + ")";
+        }
+        if (status.StartsWith("HONOR_CONFIRMATION_AMBIGUOUS|", StringComparison.Ordinal))
+        {
+            return "Coursera đang hiển thị nhiều ô xác nhận Honor Code (" + status + ")";
+        }
+
+        return status switch
+        {
+            "SUBMIT_NOT_FOUND" => "không tìm thấy nút Submit của bài hiện tại",
+            "SUBMIT_SCRIPT_FAILED" => "không đọc được trạng thái nút Submit",
+            "HONOR_CONFIRMATION_BLOCKED" => "ô xác nhận Honor Code đang bị khóa",
+            "HONOR_CONFIRMATION_CLICKED" => "Coursera chưa giữ được xác nhận Honor Code",
+            "HONOR_CONFIRMATION_LOST" => "ô xác nhận Honor Code chưa được giữ",
+            "STALE_DOCUMENT" => "trang Coursera đã đổi trong lúc chuẩn bị nộp",
+            "WRONG_PAGE" => "không còn ở trang Coursera hợp lệ",
+            _ => status
+        };
+    }
+
     private async Task HandleVideoLessonAsync()
     {
         _viewModel.StatusText = "🎥 Đang xử lý Video: Khởi tạo Enforcer...";
         await Task.Delay(2000); // Đợi khung web nạp xong
         await DismissAnyGlobalPopupsAsync(); // Phá popup ngay khi vừa load
-        
+
         // KIỂM TRA BỎ QUA: Nếu bài này đã học xong từ trước (Nút Next màu xanh) -> Bấm Next luôn và thoát!
         if (await CheckLessonCompletedAndClickNextAsync())
         {
@@ -2693,6 +4542,12 @@ public partial class MainWindow : Window
         try
         {
             Uri? appItemUri = MainWebView.Source;
+            if (IsCourseraUri(appItemUri))
+            {
+                string skippedPath = appItemUri!.AbsolutePath.TrimEnd('/');
+                _skippedLaunchAppItemPaths.Add(
+                    string.IsNullOrEmpty(skippedPath) ? "/" : skippedPath);
+            }
             _viewModel.StatusText = $"⏭️ Phát hiện {itemType}. Đang bỏ qua...";
             await Task.Delay(800);
             if (appItemUri == null || !IsSameCourseraDocument(appItemUri))
@@ -2940,29 +4795,36 @@ public partial class MainWindow : Window
     private static bool TryGetCourseHomeUri(Uri? appItemUri, out Uri? courseHomeUri)
     {
         courseHomeUri = null;
-        if (!IsCourseraUri(appItemUri))
-        {
-            return false;
-        }
-
-        string[] segments = appItemUri!.AbsolutePath.Split(
-            '/', StringSplitOptions.RemoveEmptyEntries);
-        int learnIndex = Array.FindIndex(
-            segments,
-            segment => segment.Equals("learn", StringComparison.OrdinalIgnoreCase));
-        if (learnIndex < 0 || learnIndex + 1 >= segments.Length)
-        {
-            return false;
-        }
-
-        string courseSlug = segments[learnIndex + 1];
-        if (string.IsNullOrWhiteSpace(courseSlug))
+        if (!TryGetCourseSlug(appItemUri, out string courseSlug))
         {
             return false;
         }
 
         courseHomeUri = new Uri(
             $"https://www.coursera.org/learn/{Uri.EscapeDataString(courseSlug)}/home/welcome");
+        return true;
+    }
+
+    private static bool TryGetCourseSlug(Uri? uri, out string courseSlug)
+    {
+        courseSlug = string.Empty;
+        if (!IsCourseraUri(uri))
+        {
+            return false;
+        }
+
+        string[] segments = uri!.AbsolutePath.Split(
+            '/', StringSplitOptions.RemoveEmptyEntries);
+        int learnIndex = Array.FindIndex(
+            segments,
+            segment => segment.Equals("learn", StringComparison.OrdinalIgnoreCase));
+        if (learnIndex < 0 || learnIndex + 1 >= segments.Length ||
+            string.IsNullOrWhiteSpace(segments[learnIndex + 1]))
+        {
+            return false;
+        }
+
+        courseSlug = segments[learnIndex + 1];
         return true;
     }
 
@@ -3059,7 +4921,7 @@ public partial class MainWindow : Window
                     const leafTexts = Array.from(document.querySelectorAll('span, div, p'))
                         .filter(element => element.children.length === 0)
                         .map(element => normalize(element.textContent));
-                    return leafTexts.some(text => /^Practice App Item$/i.test(text))
+                    return leafTexts.some(text => /^(?:Practice|Ungraded)\s+App\s+Item$/i.test(text))
                         ? 'PRACTICE_APP_ITEM'
                         : 'OTHER_APP_ITEM';
                 })();
@@ -3324,7 +5186,10 @@ public partial class MainWindow : Window
 
     private bool _hasExtractedFeedbackThisSession = false;
     private bool _isHandlingQuiz = false;
+    private bool _isHandlingDiscussion;
+    private bool _isAdvancingPastPendingGradedResult;
     private int _quizAttemptCount = 0;
+    private int _quizSpaAdvanceGeneration;
     private string _currentQuizUrl = "";
 
     private async Task HandleQuizAsync()
@@ -3346,6 +5211,33 @@ public partial class MainWindow : Window
             (function() {
                 var bodyText = document.body.innerText;
                 var btns = Array.from(document.querySelectorAll('button, a'));
+
+                // A submitted assessment can remain on this route while
+                // Coursera grades it.  It can still expose a ""Try again""
+                // button, so recognize this terminal-for-now state before
+                // the generic retry/start logic below.
+                var normalizedBody = String(bodyText || '')
+                    .normalize('NFKC')
+                    .replace(/[\u00a0]/g, ' ')
+                    .replace(/[—–−]/g, '-')
+                    .replace(/\s+/g, ' ')
+                    .trim()
+                    .toLowerCase();
+                var hasViewSubmission = btns.some(b => {
+                    var text = (b.innerText || b.textContent || '')
+                        .replace(/\s+/g, ' ').trim().toLowerCase();
+                    return text === 'view submission';
+                });
+                var hasPendingResults =
+                    ((/\bsubmitted\b|\bsubmission\b/.test(normalizedBody) &&
+                        /\b(?:results?|grades?|grading)\s+(?:are\s+)?pending\b/.test(normalizedBody)) ||
+                        /\bawaiting\s+(?:results?|grades?|grading)\b/.test(normalizedBody) ||
+                        /\bgrading\s+in\s+progress\b/.test(normalizedBody) ||
+                        /đã\s*nộp[\s\S]{0,100}(?:đang\s*)?chờ[\s\S]{0,80}(?:kết\s*quả|chấm\s*điểm)/i.test(normalizedBody)) &&
+                    (hasViewSubmission || /\bsubmitted\b/.test(normalizedBody));
+                if (hasPendingResults) {
+                    return 'PENDING_RESULTS';
+                }
                 
                 // QUAN TRỌNG: Nếu có nút Start Assignment → BÀI CHƯA LÀM, không thể passed!
                 var hasStartBtn = btns.some(b => {
@@ -3416,7 +5308,10 @@ public partial class MainWindow : Window
                 _viewModel.StatusText = $"🔍 Trạng thái Quiz (lần {checkAttempt + 1}): {statusResult}";
                 
                 // Nếu đã xác định được rõ ràng (không phải UNKNOWN) → dừng check
-                if (statusResult.StartsWith("PASSED") || statusResult.StartsWith("FAILED") || statusResult == "NEW")
+                if (statusResult.StartsWith("PASSED") ||
+                    statusResult.StartsWith("FAILED") ||
+                    statusResult.StartsWith("PENDING_RESULTS") ||
+                    statusResult == "NEW")
                 {
                     break;
                 }
@@ -3428,16 +5323,39 @@ public partial class MainWindow : Window
         }
 
         // ========== BƯỚC 2: XỬ LÝ TỪNG TRẠNG THÁI ==========
+
+        // --- TRẠNG THÁI 0: ĐÃ NỘP, ĐANG CHỜ CHẤM ---
+        // Coursera may still show "Try again" here.  Do not open or submit
+        // the attempt again; move on and keep this lesson out of the scanner.
+        if (statusResult.StartsWith("PENDING_RESULTS", StringComparison.Ordinal))
+        {
+            await AdvancePastPendingGradedResultAsync();
+            return;
+        }
         
         // --- TRẠNG THÁI 1: ĐÃ PASS ---
         if (statusResult.StartsWith("PASSED"))
         {
             _viewModel.StatusText = "✅ Quiz này đã Pass! Đang chuyển bài tiếp theo...";
+            Uri? passedQuizUri = MainWebView.Source;
+            string beforeNextFingerprint = await CaptureQuizActivityFingerprintAsync();
             
             // Thử bấm Next
             if (await CheckLessonCompletedAndClickNextAsync(true))
             {
-                _viewModel.StatusText = "⏭️ Đã Pass và chuyển bài thành công!";
+                _viewModel.StatusText = "⏭️ Đã bấm Next sau khi Pass; đang xác nhận bài kế tiếp...";
+                if (IsCourseraUri(passedQuizUri))
+                {
+                    // Coursera sometimes swaps the next assessment in-place
+                    // without raising a URL/navigation event.  Schedule a
+                    // targeted re-check so the new Start assignment page does
+                    // not remain idle with the old "passed" status visible.
+                    int advanceGeneration = ++_quizSpaAdvanceGeneration;
+                    _ = ResumeQuizAfterNextAsync(
+                        passedQuizUri!,
+                        beforeNextFingerprint,
+                        advanceGeneration);
+                }
                 return;
             }
             
@@ -3691,6 +5609,283 @@ public partial class MainWindow : Window
         }
     }
 
+    private async Task<string> CaptureQuizActivityFingerprintAsync()
+    {
+        const string script = """
+            (function() {
+                const normalize = value => String(value || '')
+                    .replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
+                const active = document.querySelector(
+                    'a[aria-current="page"], [data-testid^="WeekSingleItemDisplay"] a[aria-current="page"]');
+                const heading = document.querySelector('h1, [data-testid="page-header-wrapper"] h2');
+                const hasStart = Array.from(document.querySelectorAll('button, a'))
+                    .some(button => {
+                        const text = normalize(button.innerText || button.textContent).toLowerCase();
+                        return text === 'start assignment' || text === 'resume assignment';
+                    });
+                return [
+                    location.pathname,
+                    normalize(active?.getAttribute('href')),
+                    normalize(active?.innerText),
+                    normalize(heading?.innerText),
+                    hasStart ? 'start' : 'no-start'
+                ].join('|');
+            })();
+            """;
+
+        try
+        {
+            return DecodeWebViewString(await MainWebView.ExecuteScriptAsync(script));
+        }
+        catch
+        {
+            return string.Empty;
+        }
+    }
+
+    private async Task ResumeQuizAfterNextAsync(
+        Uri previousQuizUri,
+        string beforeNextFingerprint,
+        int advanceGeneration)
+    {
+        try
+        {
+            // Coursera may change only DOM (SPA) or may change the URL while
+            // the old quiz handler still holds its guard. In either case, wait
+            // for a confirmed new Start/Resume page before re-dispatching once.
+            for (int attempt = 0; attempt < 12; attempt++)
+            {
+                await Task.Delay(500);
+                if (advanceGeneration != _quizSpaAdvanceGeneration)
+                {
+                    return;
+                }
+
+                bool urlChanged = !IsSameCourseraDocument(previousQuizUri);
+
+                string currentFingerprint = await CaptureQuizActivityFingerprintAsync();
+                bool fingerprintChanged = string.IsNullOrWhiteSpace(beforeNextFingerprint) ||
+                    !string.Equals(
+                        beforeNextFingerprint,
+                        currentFingerprint,
+                        StringComparison.Ordinal);
+                if (!urlChanged && !fingerprintChanged)
+                {
+                    continue;
+                }
+
+                const string script = """
+                    (function() {
+                        const visibleEnabled = element => !!element &&
+                            element.getClientRects().length > 0 &&
+                            !element.disabled &&
+                            element.getAttribute('aria-disabled') !== 'true' &&
+                            !element.closest('[aria-hidden="true"],[inert]');
+                        const buttons = Array.from(document.querySelectorAll('button, a'));
+                        const start = buttons.find(button => {
+                            const text = String(button.innerText || button.textContent || '')
+                                .replace(/\s+/g, ' ').trim().toLowerCase();
+                            return (text === 'start assignment' ||
+                                text === 'resume assignment') && visibleEnabled(button);
+                        });
+                        return start
+                            ? 'START_READY'
+                            : 'WAITING';
+                    })();
+                    """;
+                string state = DecodeWebViewString(
+                    await MainWebView.ExecuteScriptAsync(script));
+                if (!string.Equals(state, "START_READY", StringComparison.Ordinal))
+                {
+                    continue;
+                }
+
+                _viewModel.StatusText =
+                    "➡️ Coursera đã mở bài kiểm tra mới; đang tiếp tục ngay...";
+                if (_isHandlingQuiz)
+                {
+                    // The earlier handler is still unwinding. Keep this
+                    // one-shot probe alive rather than losing the new route.
+                    continue;
+                }
+                await HandleQuizAsync();
+                return;
+            }
+        }
+        catch
+        {
+            // The normal NavigationCompleted handler remains the fallback if a
+            // transient DOM read fails during an in-place transition.
+        }
+    }
+
+    private async Task AdvancePastPendingGradedResultAsync()
+    {
+        // SourceChanged and NavigationCompleted can both arrive while Coursera
+        // finishes rendering this status page.  The quiz guard already avoids
+        // a second solver, and this guard keeps the navigation itself singular.
+        if (_isAdvancingPastPendingGradedResult)
+        {
+            return;
+        }
+
+        _isAdvancingPastPendingGradedResult = true;
+        try
+        {
+            Uri? pendingActivityUri = MainWebView.Source;
+            if (!IsCourseraUri(pendingActivityUri))
+            {
+                _viewModel.StatusText =
+                    "⏳ Bài đã nộp đang chờ chấm điểm; trang hiện tại đã thay đổi nên không chạy lại bài.";
+                return;
+            }
+
+            // Use the same canonical path representation as CheckLessonsAsync.
+            // Coursera may retain query/UTM data when opening an item, but the
+            // sidebar link uses only its path.
+            _pendingGradedResultPaths.Add(pendingActivityUri!.AbsolutePath);
+            _courseHasPendingGradedResults = true;
+            _viewModel.StatusText =
+                "⏳ Bài đã nộp, đang chờ Coursera chấm điểm. Đang chuyển sang bài tiếp theo...";
+
+            // Let a duplicate WebView event settle first.  Never issue a
+            // fallback navigation after the learner/app has already moved on.
+            await Task.Delay(250);
+            if (!IsSameCourseraDocument(pendingActivityUri))
+            {
+                return;
+            }
+
+            string beforeNextFingerprint = await CaptureQuizActivityFingerprintAsync();
+
+            // A submitted assessment may expose a usable Next button before
+            // Coursera paints the normal green/completed style.  This is the
+            // only flow allowed to use that non-primary Next control; all
+            // other lesson handlers keep the normal completion check.
+            if (await ClickPendingResultNextAsync(pendingActivityUri))
+            {
+                int advanceGeneration = ++_quizSpaAdvanceGeneration;
+                _ = ResumeQuizAfterNextAsync(
+                    pendingActivityUri,
+                    beforeNextFingerprint,
+                    advanceGeneration);
+
+                // A click can occasionally be swallowed by a transient React
+                // render.  Give it a bounded opportunity to navigate; if the
+                // same pending document remains, fall through to the scanner
+                // instead of clicking Try again or repeatedly clicking Next.
+                if (await WaitForAppItemNavigationAsync(
+                        pendingActivityUri,
+                        TimeSpan.FromSeconds(2)) ||
+                    !IsSameCourseraDocument(pendingActivityUri))
+                {
+                    _viewModel.StatusText =
+                        "⏭️ Bài đang chờ chấm điểm đã được bỏ qua; đang mở bài tiếp theo...";
+                    return;
+                }
+            }
+
+            if (!IsSameCourseraDocument(pendingActivityUri))
+            {
+                return;
+            }
+
+            // Not every pending page exposes Next.  Returning to the canonical
+            // course home invokes the scanner, which now ignores this exact
+            // pending lesson path and selects the next eligible activity.
+            if (TryGetCourseHomeUri(pendingActivityUri, out Uri? courseHomeUri) &&
+                courseHomeUri != null)
+            {
+                MainWebView.Source = courseHomeUri;
+                _viewModel.StatusText =
+                    "⏭️ Bài đang chờ chấm điểm không có nút tiếp theo; đang quét bài kế tiếp...";
+                return;
+            }
+
+            _viewModel.StatusText =
+                "⏳ Bài đã nộp đang chờ chấm điểm. Không xác định được trang khóa học để chuyển tiếp, nên không chạy lại bài.";
+        }
+        catch (Exception exception)
+        {
+            _viewModel.StatusText =
+                "⏳ Bài đã nộp đang chờ chấm điểm; Worker đã chặn làm lại bài. " + exception.Message;
+        }
+        finally
+        {
+            _isAdvancingPastPendingGradedResult = false;
+        }
+    }
+
+    private async Task<bool> ClickPendingResultNextAsync(Uri pendingActivityUri)
+    {
+        // Deliberately separate from CheckLessonCompletedAndClickNextAsync:
+        // its primary-button requirement is correct for every ordinary lesson.
+        // Here we have already positively identified an accepted submission
+        // that is only waiting for grading, so a visible enabled Next is safe
+        // to use even before Coursera colors it as complete.
+        string expectedUrlJson = JsonSerializer.Serialize(pendingActivityUri.ToString());
+        string script = $$"""
+            (function() {
+                const expected = new URL({{expectedUrlJson}});
+                const current = new URL(location.href);
+                if (current.origin !== expected.origin ||
+                    current.pathname !== expected.pathname ||
+                    current.search !== expected.search) {
+                    return 'STALE_DOCUMENT';
+                }
+
+                const normalize = value => String(value || '')
+                    .replace(/\u00a0/g, ' ')
+                    .replace(/\s+/g, ' ')
+                    .trim()
+                    .toLowerCase();
+                const normalizedBody = normalize(document.body?.innerText);
+                const hasPendingResultState =
+                    ((/\bsubmitted\b|\bsubmission\b/.test(normalizedBody) &&
+                        /\b(?:results?|grades?|grading)\s+(?:are\s+)?pending\b/.test(normalizedBody)) ||
+                        /\bawaiting\s+(?:results?|grades?|grading)\b/.test(normalizedBody) ||
+                        /\bgrading\s+in\s+progress\b/.test(normalizedBody) ||
+                        /đã\s*nộp[\s\S]{0,100}(?:đang\s*)?chờ[\s\S]{0,80}(?:kết\s*quả|chấm\s*điểm)/i.test(normalizedBody));
+                if (!hasPendingResultState) {
+                    return 'NOT_PENDING';
+                }
+                const isVisible = element => !!element &&
+                    element.getClientRects().length > 0 &&
+                    window.getComputedStyle(element).display !== 'none' &&
+                    window.getComputedStyle(element).visibility !== 'hidden' &&
+                    Number.parseFloat(window.getComputedStyle(element).opacity || '1') > 0 &&
+                    !element.closest('[aria-hidden="true"]') &&
+                    !element.closest('[inert]');
+                const isEnabled = element => !element.matches(':disabled') &&
+                    !element.closest('[aria-disabled="true"], [disabled]') &&
+                    normalize(element.getAttribute('aria-disabled')) !== 'true';
+                const candidates = Array.from(document.querySelectorAll(
+                    'button[aria-label="Go to next item"], ' +
+                    'a[aria-label="Go to next item"], ' +
+                    '[role="button"][aria-label="Go to next item"]'));
+                const next = candidates.find(element =>
+                    isVisible(element) && isEnabled(element));
+                if (!next) {
+                    return 'NOT_FOUND';
+                }
+
+                next.click();
+                return 'CLICKED';
+            })();
+            """;
+
+        try
+        {
+            string result = DecodeWebViewString(
+                await MainWebView.ExecuteScriptAsync(script));
+            return string.Equals(result, "CLICKED", StringComparison.Ordinal);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
     private async Task SolveOpenEndedQuizAsync()
     {
         _viewModel.StatusText = "✍️ Đang quét câu hỏi tự luận...";
@@ -3749,7 +5944,7 @@ public partial class MainWindow : Window
 
                 if (!aiResult.Success)
                 {
-                    _viewModel.StatusText = "❌ Lỗi AI: " + aiResult.UserMessage;
+                    await FailCourseJobForAiErrorAsync(aiResult.UserMessage);
                     return;
                 }
 
@@ -3786,21 +5981,13 @@ public partial class MainWindow : Window
         await MainWebView.ExecuteScriptAsync("window.scrollTo(0, document.body.scrollHeight);");
         await Task.Delay(1000);
 
-        string jsSubmit = @"
-            (function() {
-                var honorCode = document.getElementById('agreement-checkbox-base');
-                if (honorCode && !honorCode.checked) honorCode.click();
-                
-                var submitBtn = document.querySelector('button[data-testid=""submit-button""]');
-                if (submitBtn) submitBtn.scrollIntoView({ block: 'center' });
-                
-                setTimeout(function() {
-                    var btn = document.querySelector('button[data-testid=""submit-button""]');
-                    if (btn && !btn.disabled) btn.click();
-                }, 500);
-            })();
-        ";
-        await MainWebView.ExecuteScriptAsync(jsSubmit);
+        string primarySubmitStatus = await WaitForCourseraPrimarySubmitAsync(clickWhenReady: true);
+        if (primarySubmitStatus != "CLICKED")
+        {
+            _viewModel.StatusText =
+                $"⚠️ Chưa thể bấm nộp bài tự luận ({DescribeCourseraSubmitStatus(primarySubmitStatus)}). Đáp án vẫn được giữ nguyên.";
+            return;
+        }
         await Task.Delay(2500);
 
         string confirmStatus = await ConfirmOwnedCourseraSubmissionAsync();
@@ -4002,9 +6189,10 @@ public partial class MainWindow : Window
         sb.AppendLine("You MUST return ONLY a raw JSON array of arrays, in exactly the same question order.");
         sb.AppendLine("For SHORT_TEXT, return exactly one concise answer string in its inner array.");
         sb.AppendLine("For LONG_TEXT, return exactly one thoughtful 2-3 sentence English answer in its inner array.");
-        sb.AppendLine("For SINGLE_CHOICE, return exactly one string copied verbatim from the visible options.");
-        sb.AppendLine("For MULTI_CHOICE, return every correct option copied verbatim from the visible options.");
-        sb.AppendLine("Do NOT include markdown or explanations. Example: [[\"80\"], [\"GET\"], [\"Content type\"], [\"a\", \"img\"]]");
+        sb.AppendLine("For SINGLE_CHOICE, return exactly one stable option token, such as Q1-O2.");
+        sb.AppendLine("For MULTI_CHOICE, return every correct stable option token, such as Q4-O1 and Q4-O3.");
+        sb.AppendLine("Do NOT return option prose, A/B/C letters, markdown, or explanations.");
+        sb.AppendLine("Example: [[\"80\"], [\"GET\"], [\"Q3-O2\"], [\"Q4-O1\", \"Q4-O3\"]]");
         sb.AppendLine();
         foreach (var q in questionList)
         {
@@ -4019,9 +6207,9 @@ public partial class MainWindow : Window
             sb.AppendLine($"Q{q.Index + 1} [{kindLabel}]: {q.Question}");
             if (q.Kind == "single_choice" || q.Kind == "multi_choice")
             {
-                foreach (var opt in q.Options)
+                for (var optionIndex = 0; optionIndex < q.Options.Count; optionIndex++)
                 {
-                    sb.AppendLine($"- {opt.Text}");
+                    sb.AppendLine($"- Q{q.Index + 1}-O{optionIndex + 1}: {q.Options[optionIndex].Text}");
                 }
             }
             sb.AppendLine();
@@ -4031,77 +6219,28 @@ public partial class MainWindow : Window
             "You solve a batch of mixed short-text, long-text, single-choice, and multiple-choice questions. " +
             "Follow the exact output schema requested by the user. Return only one raw JSON array of arrays " +
             "with one inner array per question. Text questions have exactly one answer string; choice answers " +
-            "must copy the visible option text exactly. Do not use markdown or explanations.";
-        AiCompletionResult aiResult = await GetAnswerFromAiAsync(
+            "must use only the stable Qn-Om option tokens provided by the user. Do not use markdown or explanations.";
+        QuizAnswerResolution answerResolution = await RequestValidatedQuizAnswersAsync(
+            questionList,
             sb.ToString(),
-            isDiscussion: false,
-            customSystemPrompt: batchQuizSystemPrompt);
-        if (!aiResult.Success)
+            batchQuizSystemPrompt);
+        if (!answerResolution.Success)
         {
-            _viewModel.StatusText = "❌ Lỗi AI: " + aiResult.UserMessage;
+            if (answerResolution.IsAiFailure)
+            {
+                await FailCourseJobForAiErrorAsync(answerResolution.Message);
+            }
+            else
+            {
+                _viewModel.StatusText = "⚠️ " + answerResolution.Message + " Chưa điền hoặc nộp bài.";
+            }
             return;
         }
 
-        string aiResponse = aiResult.Content;
-        
-        // Làm sạch response (Đề phòng AI vẫn bọc markdown)
-        aiResponse = aiResponse.Replace("```json", "").Replace("```", "").Trim();
-        
-        List<List<string>>? selectedAnswers;
-        try
-        {
-            selectedAnswers = System.Text.Json.JsonSerializer.Deserialize<List<List<string>>>(aiResponse);
-        }
-        catch (System.Text.Json.JsonException)
-        {
-            _viewModel.StatusText = "❌ AI trả về sai định dạng JSON. Đã dừng, chưa nộp bài.";
-            return;
-        }
-
-        if (selectedAnswers == null)
-        {
-            _viewModel.StatusText = "❌ AI trả về null. Đã dừng, chưa nộp bài.";
-            return;
-        }
-
-        if (selectedAnswers.Count != questionList.Count)
-        {
-            _viewModel.StatusText = $"⚠️ {aiResult.ProviderName} chỉ trả về {selectedAnswers.Count}/{questionList.Count} đáp án. Đã dừng để tránh nộp thiếu.";
-            return;
-        }
-
-        // Kiểm tra toàn bộ hình dạng dữ liệu trước khi thay đổi bất kỳ ô nào.
-        for (int i = 0; i < selectedAnswers.Count; i++)
-        {
-            var q = questionList[i];
-            var answers = selectedAnswers[i];
-            if (answers == null || answers.Any(string.IsNullOrWhiteSpace))
-            {
-                _viewModel.StatusText = $"⚠️ AI trả đáp án trống cho câu {q.Index + 1}. Đã dừng, chưa nộp bài.";
-                return;
-            }
-
-            if ((q.Kind == "short_text" || q.Kind == "long_text") && answers.Count != 1)
-            {
-                _viewModel.StatusText = $"⚠️ Câu điền chữ {q.Index + 1} cần đúng 1 đáp án nhưng AI trả {answers.Count}. Đã dừng.";
-                return;
-            }
-
-            if (q.Kind == "single_choice" && answers.Count != 1)
-            {
-                _viewModel.StatusText = $"⚠️ Câu radio {q.Index + 1} cần đúng 1 đáp án nhưng AI trả {answers.Count}. Đã dừng.";
-                return;
-            }
-
-            if (q.Kind == "multi_choice" && answers.Count == 0)
-            {
-                _viewModel.StatusText = $"⚠️ Câu checkbox {q.Index + 1} không có đáp án. Đã dừng.";
-                return;
-            }
-        }
+        List<List<string>> selectedAnswers = answerResolution.Answers!;
 
         var finalVerificationPlan = new List<QuizVerificationQuestion>();
-        _viewModel.StatusText = $"✅ {aiResult.ProviderName} đã giải xong ({selectedAnswers.Count} câu)! Đang điền và kiểm tra lại...";
+        _viewModel.StatusText = $"✅ {answerResolution.ProviderName} đã giải xong ({selectedAnswers.Count} câu)! Đang điền và kiểm tra lại...";
 
         for (int i = 0; i < selectedAnswers.Count; i++)
         {
@@ -4274,19 +6413,55 @@ public partial class MainWindow : Window
                        (cleanQ.Contains(cleanF) || cleanF.Contains(cleanQ));
             });
 
+            string feedbackValidationError = string.Empty;
             if (feedback != null && feedback.IsMissingAnswers)
             {
+                // Feedback may have punctuation/Unicode differences from the live
+                // Coursera option. Resolve it through the same stable-token mapper
+                // before it reaches the browser. If it cannot be resolved, ask the
+                // AI for this one question again instead of stopping the course.
+                var knownTexts = new HashSet<string>(StringComparer.Ordinal);
                 foreach (var correctAns in feedback.CorrectAnswers)
                 {
-                    if (!ansList.Any(a => NormalizeChoiceText(a) == NormalizeChoiceText(correctAns)))
+                    if (!TryResolveChoiceAnswer(q, correctAns, out string? canonicalCorrect))
                     {
-                        ansList.Add(correctAns);
+                        feedbackValidationError =
+                            $"feedback của Coursera có lựa chọn không map được: {TrimForStatus(correctAns)}";
+                        continue;
+                    }
+
+                    string normalizedCorrect = NormalizeChoiceText(canonicalCorrect!);
+                    knownTexts.Add(normalizedCorrect);
+                    if (!ansList.Any(a =>
+                            string.Equals(
+                                NormalizeChoiceText(a),
+                                normalizedCorrect,
+                                StringComparison.Ordinal)))
+                    {
+                        ansList.Add(canonicalCorrect!);
                     }
                 }
 
-                var knownTexts = feedback.CorrectAnswers.Concat(feedback.WrongAnswers)
-                    .Select(NormalizeChoiceText).ToHashSet();
-                bool hasNewAnswer = ansList.Any(a => !knownTexts.Contains(NormalizeChoiceText(a)));
+                foreach (var wrongAns in feedback.WrongAnswers)
+                {
+                    if (TryResolveChoiceAnswer(q, wrongAns, out string? canonicalWrong))
+                    {
+                        string normalizedWrong = NormalizeChoiceText(canonicalWrong!);
+                        knownTexts.Add(normalizedWrong);
+                        // Coursera explicitly marked this option wrong on the
+                        // previous attempt.  Do not let a valid-but-known-wrong
+                        // answer slip through merely because its token format is
+                        // structurally valid.
+                        ansList.RemoveAll(a =>
+                            string.Equals(
+                                NormalizeChoiceText(a),
+                                normalizedWrong,
+                                StringComparison.Ordinal));
+                    }
+                }
+
+                bool hasNewAnswer = ansList.Any(a =>
+                    !knownTexts.Contains(NormalizeChoiceText(a)));
                 if (!hasNewAnswer)
                 {
                     var untriedOption = q.Options.FirstOrDefault(opt =>
@@ -4298,29 +6473,78 @@ public partial class MainWindow : Window
                 }
             }
 
-            var normalizedAnswers = ansList.Select(NormalizeChoiceText).ToList();
-            if (normalizedAnswers.Any(string.IsNullOrWhiteSpace) ||
-                normalizedAnswers.Distinct().Count() != normalizedAnswers.Count)
+            // Never pass an unmatched/duplicate choice into the DOM. A malformed
+            // answer is repaired against the exact options currently on screen and
+            // retried until it is locally valid.
+            if (!TryCanonicalizeQuizAnswersForQuestion(
+                    q,
+                    ansList,
+                    out List<string>? canonicalChoiceAnswers,
+                    out string choiceValidationError) ||
+                !string.IsNullOrEmpty(feedbackValidationError))
             {
-                _viewModel.StatusText = $"⚠️ Đáp án câu {q.Index + 1} bị trống hoặc trùng. Đã dừng.";
-                return;
+                string repairReason = !string.IsNullOrEmpty(feedbackValidationError)
+                    ? feedbackValidationError
+                    : choiceValidationError;
+                QuizAnswerResolution repair = await RepairQuizQuestionAnswerAsync(q, repairReason);
+                if (!repair.Success)
+                {
+                    if (repair.IsAiFailure)
+                    {
+                        await FailCourseJobForAiErrorAsync(repair.Message);
+                    }
+                    else
+                    {
+                        _viewModel.StatusText = "⚠️ " + repair.Message + " Chưa điền hoặc nộp bài.";
+                    }
+                    return;
+                }
+
+                ansList = repair.Answers![0];
+                selectedAnswers[i] = ansList;
+            }
+            else
+            {
+                ansList = canonicalChoiceAnswers!;
+                selectedAnswers[i] = ansList;
             }
 
-            var unmatchedAnswers = ansList.Where(answer =>
-                !q.Options.Any(opt => NormalizeChoiceText(opt.Text) == NormalizeChoiceText(answer))).ToList();
-            if (unmatchedAnswers.Count > 0)
-            {
-                _viewModel.StatusText = $"⚠️ AI trả lựa chọn không khớp ở câu {q.Index + 1}. Đã dừng để tránh chọn nhầm.";
-                return;
-            }
+            var normalizedAnswers = ansList.Select(NormalizeChoiceText).ToList();
 
             var matchedOptions = q.Options.Where(opt =>
                 normalizedAnswers.Contains(NormalizeChoiceText(opt.Text))).ToList();
             if ((q.Kind == "single_choice" && matchedOptions.Count != 1) ||
                 (q.Kind == "multi_choice" && matchedOptions.Count == 0))
             {
-                _viewModel.StatusText = $"⚠️ Số lựa chọn câu {q.Index + 1} không hợp lệ. Đã dừng.";
-                return;
+                // Defensive fallback for a live DOM change between extraction and
+                // filling. Do not choose a potentially wrong option; ask again.
+                QuizAnswerResolution repair = await RepairQuizQuestionAnswerAsync(
+                    q,
+                    $"Coursera đang có {matchedOptions.Count} lựa chọn khớp, không đúng kiểu câu hỏi");
+                if (!repair.Success)
+                {
+                    if (repair.IsAiFailure)
+                    {
+                        await FailCourseJobForAiErrorAsync(repair.Message);
+                    }
+                    else
+                    {
+                        _viewModel.StatusText = "⚠️ " + repair.Message + " Chưa điền hoặc nộp bài.";
+                    }
+                    return;
+                }
+
+                ansList = repair.Answers![0];
+                selectedAnswers[i] = ansList;
+                normalizedAnswers = ansList.Select(NormalizeChoiceText).ToList();
+                matchedOptions = q.Options.Where(opt =>
+                    normalizedAnswers.Contains(NormalizeChoiceText(opt.Text))).ToList();
+                if ((q.Kind == "single_choice" && matchedOptions.Count != 1) ||
+                    (q.Kind == "multi_choice" && matchedOptions.Count == 0))
+                {
+                    _viewModel.StatusText = $"⚠️ Câu {q.Index + 1} đã thay đổi lựa chọn trên Coursera. Chưa điền hoặc nộp bài.";
+                    return;
+                }
             }
 
             _viewModel.StatusText = $"📝 Q{q.Index + 1}: AI chọn {matchedOptions.Count} đáp án: " +
@@ -4634,37 +6858,18 @@ public partial class MainWindow : Window
             return;
         }
         
-        // Chuẩn bị điều kiện nộp; chưa bấm Submit ở bước này.
-        string jsPrepareSubmit = @"
-            (function() {
-                var submitBtn = document.querySelector('button[data-testid=""submit-button""]');
-                if (!submitBtn) return 'SUBMIT_NOT_FOUND';
-                submitBtn.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                
-                var honorCode = document.getElementById('agreement-checkbox-base');
-                if (honorCode && !honorCode.checked) {
-                    if (honorCode.disabled) return 'HONOR_CONFIRMATION_BLOCKED';
-                    honorCode.click();
-                    return 'HONOR_CONFIRMATION_CLICKED';
-                }
-                return 'READY';
-            })();
-        ";
-        string prepareSubmitStatus = DecodeWebViewString(
-            await MainWebView.ExecuteScriptAsync(jsPrepareSubmit));
-        if (prepareSubmitStatus == "HONOR_CONFIRMATION_CLICKED")
-        {
-            await Task.Delay(600);
-            prepareSubmitStatus = DecodeWebViewString(
-                await MainWebView.ExecuteScriptAsync(jsPrepareSubmit));
-        }
+        // Coursera can momentarily render duplicate/disabled Submit controls.
+        // Poll the one visible control until React has applied the Honor Code
+        // state; do not confuse a hidden copy with the live quiz button.
+        string prepareSubmitStatus = await WaitForCourseraPrimarySubmitAsync(clickWhenReady: false);
         if (prepareSubmitStatus != "READY")
         {
-            _viewModel.StatusText = $"⚠️ Không chuẩn bị được nút nộp ({prepareSubmitStatus}). Chưa nộp bài.";
+            _viewModel.StatusText =
+                $"⚠️ Không chuẩn bị được nút nộp ({DescribeCourseraSubmitStatus(prepareSubmitStatus)}). Chưa nộp bài.";
             return;
         }
 
-        await Task.Delay(700);
+        await Task.Delay(250);
         string secondVerifyStatus = DecodeWebViewString(
             await MainWebView.ExecuteScriptAsync(jsVerifyAllAnswers));
         if (secondVerifyStatus != "OK")
@@ -4699,22 +6904,13 @@ public partial class MainWindow : Window
             }
         }
 
-        string jsClickPrimarySubmit = @"
-            (function() {
-                var btn = document.querySelector('button[data-testid=""submit-button""]');
-                if (!btn) return 'SUBMIT_NOT_FOUND';
-                var honorCode = document.getElementById('agreement-checkbox-base');
-                if (honorCode && !honorCode.checked) return 'HONOR_CONFIRMATION_LOST';
-                if (btn.disabled) return 'SUBMIT_DISABLED';
-                btn.click();
-                return 'CLICKED';
-            })();
-        ";
-        string primarySubmitStatus = DecodeWebViewString(
-            await MainWebView.ExecuteScriptAsync(jsClickPrimarySubmit));
+        // Re-query immediately before the click because the verification/name
+        // checks above can cause Coursera to re-render its submit region.
+        string primarySubmitStatus = await WaitForCourseraPrimarySubmitAsync(clickWhenReady: true);
         if (primarySubmitStatus != "CLICKED")
         {
-            _viewModel.StatusText = $"⚠️ Chưa thể bấm nộp ({primarySubmitStatus}). Đáp án vẫn được giữ nguyên.";
+            _viewModel.StatusText =
+                $"⚠️ Chưa thể bấm nộp ({DescribeCourseraSubmitStatus(primarySubmitStatus)}). Đáp án vẫn được giữ nguyên.";
             return;
         }
 
@@ -5226,9 +7422,399 @@ public partial class MainWindow : Window
                status == "SET_AND_VERIFIED";
     }
 
+    private async Task<QuizAnswerResolution> RequestValidatedQuizAnswersAsync(
+        IReadOnlyList<QuizQuestion> questions,
+        string batchPrompt,
+        string batchSystemPrompt)
+    {
+        List<List<string>>? rawAnswers = null;
+        string providerName = "AgentRouter";
+        string validationError = string.Empty;
+
+        // A malformed batch has no safe question-to-answer alignment, so ask for
+        // the complete matrix again before touching any Coursera input.
+        for (var batchAttempt = 1; ; batchAttempt++)
+        {
+            if (batchAttempt > 1)
+            {
+                _viewModel.StatusText =
+                    $"🤖 AI trả sai cấu trúc; đang yêu cầu lại toàn bộ đáp án (lần {batchAttempt})...";
+            }
+
+            AiCompletionResult aiResult = await GetAnswerFromAiAsync(
+                batchAttempt == 1
+                    ? batchPrompt
+                    : BuildQuizBatchRepairPrompt(batchPrompt, validationError),
+                isDiscussion: false,
+                customSystemPrompt: batchSystemPrompt);
+            if (!aiResult.Success)
+            {
+                return QuizAnswerResolution.AiFailed(aiResult.UserMessage);
+            }
+
+            providerName = aiResult.ProviderName;
+            if (TryDeserializeQuizAnswerMatrix(
+                    aiResult.Content,
+                    questions.Count,
+                    out rawAnswers,
+                    out validationError))
+            {
+                break;
+            }
+
+            await Task.Delay(300);
+        }
+
+        // The loop only exits after a successful deserialize; retain a defensive
+        // guard so a future control-flow change cannot dereference a null matrix.
+        if (rawAnswers == null)
+        {
+            return QuizAnswerResolution.ValidationFailed(
+                "Không nhận được ma trận đáp án từ AI");
+        }
+
+        var canonicalAnswers = new List<List<string>>(questions.Count);
+        for (var questionPosition = 0; questionPosition < questions.Count; questionPosition++)
+        {
+            QuizQuestion question = questions[questionPosition];
+            if (TryCanonicalizeQuizAnswersForQuestion(
+                    question,
+                    rawAnswers[questionPosition],
+                    out List<string>? canonical,
+                    out validationError))
+            {
+                canonicalAnswers.Add(canonical!);
+                continue;
+            }
+
+            // The surrounding matrix is aligned, so only repair the bad question.
+            // This preserves every already valid answer and retries until a token
+            // can be mapped unambiguously to one visible Coursera option.
+            QuizAnswerResolution repair = await RepairQuizQuestionAnswerAsync(
+                question,
+                validationError);
+            if (!repair.Success)
+            {
+                return repair;
+            }
+
+            canonicalAnswers.Add(repair.Answers![0]);
+            providerName = repair.ProviderName;
+        }
+
+        return QuizAnswerResolution.Completed(canonicalAnswers, providerName);
+    }
+
+    private async Task<QuizAnswerResolution> RepairQuizQuestionAnswerAsync(
+        QuizQuestion question,
+        string initialValidationError)
+    {
+        string validationError = initialValidationError;
+        string providerName = "AgentRouter";
+        const string repairSystemPrompt =
+            "You repair one quiz answer format. Return only one raw JSON array of strings. " +
+            "For a choice question, use only the exact Qn-Om option token supplied by the user. " +
+            "Never return explanations, markdown, or option prose.";
+
+        for (var repairAttempt = 1; ; repairAttempt++)
+        {
+            _viewModel.StatusText =
+                $"🤖 AI trả lời chưa khớp ở câu {question.Index + 1}; đang hỏi lại (lần {repairAttempt})...";
+
+            AiCompletionResult aiResult = await GetAnswerFromAiAsync(
+                BuildQuizQuestionRepairPrompt(question, validationError),
+                isDiscussion: false,
+                customSystemPrompt: repairSystemPrompt);
+            if (!aiResult.Success)
+            {
+                return QuizAnswerResolution.AiFailed(aiResult.UserMessage);
+            }
+
+            providerName = aiResult.ProviderName;
+            if (TryDeserializeSingleQuizAnswer(aiResult.Content, out List<string>? repairedAnswers) &&
+                TryCanonicalizeQuizAnswersForQuestion(
+                    question,
+                    repairedAnswers!,
+                    out List<string>? canonical,
+                    out validationError))
+            {
+                return QuizAnswerResolution.Completed(
+                    new List<List<string>> { canonical! },
+                    providerName);
+            }
+
+            await Task.Delay(300);
+        }
+    }
+
+    private static string BuildQuizBatchRepairPrompt(string batchPrompt, string validationError) =>
+        $"""
+        {batchPrompt}
+
+        FORMAT REPAIR REQUIRED: The previous answer was rejected locally because: {validationError}
+        Return the complete raw JSON array again, with exactly one inner array for every question.
+        For every choice question, return only the supplied Qn-Om tokens. Do not return option text or A/B/C letters.
+        """;
+
+    private static string BuildQuizQuestionRepairPrompt(
+        QuizQuestion question,
+        string validationError)
+    {
+        var prompt = new StringBuilder();
+        string kindLabel = question.Kind switch
+        {
+            "short_text" => "SHORT_TEXT",
+            "long_text" => "LONG_TEXT",
+            "single_choice" => "SINGLE_CHOICE",
+            "multi_choice" => "MULTI_CHOICE",
+            _ => "UNSUPPORTED"
+        };
+
+        prompt.AppendLine("Repair the answer for exactly one quiz question.");
+        prompt.AppendLine($"Q{question.Index + 1} [{kindLabel}]: {question.Question}");
+        if (question.Kind is "single_choice" or "multi_choice")
+        {
+            for (var optionIndex = 0; optionIndex < question.Options.Count; optionIndex++)
+            {
+                prompt.AppendLine(
+                    $"- Q{question.Index + 1}-O{optionIndex + 1}: {question.Options[optionIndex].Text}");
+            }
+        }
+
+        prompt.AppendLine($"The previous answer was invalid: {validationError}");
+        prompt.AppendLine("Return ONLY one raw JSON array of strings.");
+        prompt.AppendLine(question.Kind == "single_choice"
+            ? $"Example: [\"Q{question.Index + 1}-O2\"]"
+            : question.Kind == "multi_choice"
+                ? $"Example: [\"Q{question.Index + 1}-O1\", \"Q{question.Index + 1}-O3\"]"
+                : "Example: [\"one concise answer\"]");
+        return prompt.ToString();
+    }
+
+    private static bool TryDeserializeQuizAnswerMatrix(
+        string response,
+        int expectedQuestionCount,
+        out List<List<string>>? answers,
+        out string validationError)
+    {
+        answers = null;
+        validationError = string.Empty;
+        string cleanedResponse = CleanAiJsonResponse(response);
+        try
+        {
+            List<List<string>>? parsed = JsonSerializer.Deserialize<List<List<string>>>(cleanedResponse);
+            if (parsed == null)
+            {
+                validationError = "AI trả JSON null";
+                return false;
+            }
+
+            if (parsed.Count != expectedQuestionCount)
+            {
+                validationError = $"AI trả {parsed.Count}/{expectedQuestionCount} nhóm đáp án";
+                return false;
+            }
+
+            answers = parsed.Select(answerList =>
+                    answerList?.Select(answer => answer?.Trim() ?? string.Empty).ToList()
+                    ?? new List<string>())
+                .ToList();
+            return true;
+        }
+        catch (JsonException)
+        {
+            validationError = "AI không trả về raw JSON array hợp lệ";
+            return false;
+        }
+    }
+
+    private static bool TryDeserializeSingleQuizAnswer(
+        string response,
+        out List<string>? answers)
+    {
+        answers = null;
+        try
+        {
+            List<string>? parsed = JsonSerializer.Deserialize<List<string>>(
+                CleanAiJsonResponse(response));
+            if (parsed == null)
+            {
+                return false;
+            }
+
+            answers = parsed.Select(answer => answer?.Trim() ?? string.Empty).ToList();
+            return true;
+        }
+        catch (JsonException)
+        {
+            return false;
+        }
+    }
+
+    private static string CleanAiJsonResponse(string response) =>
+        (response ?? string.Empty)
+            .Replace("```json", string.Empty, StringComparison.OrdinalIgnoreCase)
+            .Replace("```", string.Empty, StringComparison.Ordinal)
+            .Trim();
+
+    private static bool TryCanonicalizeQuizAnswersForQuestion(
+        QuizQuestion question,
+        IReadOnlyList<string> answers,
+        out List<string>? canonicalAnswers,
+        out string validationError)
+    {
+        canonicalAnswers = null;
+        validationError = string.Empty;
+        if (answers.Count == 0 || answers.Any(string.IsNullOrWhiteSpace))
+        {
+            validationError = $"câu {question.Index + 1} có đáp án trống";
+            return false;
+        }
+
+        if (question.Kind is "short_text" or "long_text")
+        {
+            if (answers.Count != 1)
+            {
+                validationError = $"câu điền chữ {question.Index + 1} cần đúng 1 đáp án";
+                return false;
+            }
+
+            canonicalAnswers = new List<string> { answers[0].Trim() };
+            return true;
+        }
+
+        if (question.Kind == "single_choice" && answers.Count != 1)
+        {
+            validationError = $"câu radio {question.Index + 1} cần đúng 1 mã lựa chọn";
+            return false;
+        }
+
+        if (question.Kind is not ("single_choice" or "multi_choice"))
+        {
+            validationError = $"câu {question.Index + 1} có kiểu trả lời chưa hỗ trợ";
+            return false;
+        }
+
+        var canonical = new List<string>(answers.Count);
+        foreach (string answer in answers)
+        {
+            if (!TryResolveChoiceAnswer(question, answer, out string? canonicalOption))
+            {
+                validationError =
+                    $"mã/lựa chọn \"{TrimForStatus(answer)}\" không thuộc câu {question.Index + 1}";
+                return false;
+            }
+
+            if (canonical.Any(existing =>
+                    string.Equals(
+                        NormalizeChoiceText(existing),
+                        NormalizeChoiceText(canonicalOption!),
+                        StringComparison.Ordinal)))
+            {
+                validationError = $"câu {question.Index + 1} có mã lựa chọn trùng";
+                return false;
+            }
+
+            canonical.Add(canonicalOption!);
+        }
+
+        canonicalAnswers = canonical;
+        return true;
+    }
+
+    private static bool TryResolveChoiceAnswer(
+        QuizQuestion question,
+        string answer,
+        out string? canonicalOption)
+    {
+        canonicalOption = null;
+        string normalizedAnswer = NormalizeChoiceText(answer);
+        QuizOption? exactOption = question.Options.FirstOrDefault(option =>
+            string.Equals(
+                NormalizeChoiceText(option.Text),
+                normalizedAnswer,
+                StringComparison.Ordinal));
+        if (exactOption != null)
+        {
+            canonicalOption = exactOption.Text;
+            return true;
+        }
+
+        string token = (answer ?? string.Empty).Trim().Trim('"', '\'', '`');
+        var taggedToken = System.Text.RegularExpressions.Regex.Match(
+            token,
+            @"^q\s*(?<question>\d+)\s*[-_:.]\s*(?:option|opt|o)\s*(?<option>\d+)\s*[.)]?$",
+            System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        if (taggedToken.Success)
+        {
+            if (!int.TryParse(taggedToken.Groups["question"].Value, out int taggedQuestion) ||
+                taggedQuestion != question.Index + 1 ||
+                !int.TryParse(taggedToken.Groups["option"].Value, out int taggedOption))
+            {
+                return false;
+            }
+
+            return TryResolveOptionNumber(question, taggedOption, out canonicalOption);
+        }
+
+        var numberedToken = System.Text.RegularExpressions.Regex.Match(
+            token,
+            @"^(?:option|opt|o)?\s*[_#:\-]?\s*(?<option>\d+)\s*[.)]?$",
+            System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        if (numberedToken.Success &&
+            int.TryParse(numberedToken.Groups["option"].Value, out int numberedOption))
+        {
+            return TryResolveOptionNumber(question, numberedOption, out canonicalOption);
+        }
+
+        var letterToken = System.Text.RegularExpressions.Regex.Match(
+            token,
+            @"^(?:option\s*)?(?<letter>[A-Za-z])\s*[.)]?$",
+            System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        if (!letterToken.Success)
+        {
+            return false;
+        }
+
+        int letterOption = char.ToUpperInvariant(letterToken.Groups["letter"].Value[0]) - 'A' + 1;
+        return TryResolveOptionNumber(question, letterOption, out canonicalOption);
+    }
+
+    private static bool TryResolveOptionNumber(
+        QuizQuestion question,
+        int optionNumber,
+        out string? canonicalOption)
+    {
+        canonicalOption = null;
+        if (optionNumber < 1 || optionNumber > question.Options.Count)
+        {
+            return false;
+        }
+
+        canonicalOption = question.Options[optionNumber - 1].Text;
+        return true;
+    }
+
+    private static string TrimForStatus(string value)
+    {
+        string normalized = string.Join(
+            " ",
+            (value ?? string.Empty).Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries));
+        return normalized.Length <= 80 ? normalized : normalized[..80] + "…";
+    }
+
     private static string NormalizeChoiceText(string value)
     {
-        return System.Text.RegularExpressions.Regex.Replace(value ?? string.Empty, @"\s+", " ")
+        string unicodeNormalized = (value ?? string.Empty)
+            .Normalize(NormalizationForm.FormKC)
+            .Replace('\u00A0', ' ')
+            .Replace('\u2018', '\'')
+            .Replace('\u2019', '\'')
+            .Replace('\u201C', '"')
+            .Replace('\u201D', '"')
+            .Replace('\u2013', '-')
+            .Replace('\u2014', '-');
+        return System.Text.RegularExpressions.Regex.Replace(unicodeNormalized, @"\s+", " ")
             .Trim()
             .ToLowerInvariant();
     }
@@ -5262,44 +7848,203 @@ public partial class MainWindow : Window
             isDiscussion ? 0.7 : 0.1,
             progress);
     }
+    private const string DefaultDiscussionReply =
+        "Thanks for sharing. This was a useful learning activity.";
+
     private async Task HandleDiscussionAsync()
     {
-        _viewModel.StatusText = "🗣️ Đang xử lý bài Thảo luận (Discussion Prompt)...";
-        await Task.Delay(3000);
-        await DismissAnyGlobalPopupsAsync();
-
-        if (await CheckLessonCompletedAndClickNextAsync())
+        // Both SourceChanged and NavigationCompleted can be raised for the same
+        // Coursera document.  A discussion must never be posted (or inspected)
+        // twice because of that duplicate notification.
+        if (_isHandlingDiscussion)
         {
-            _viewModel.StatusText = "⏭️ Bài Thảo luận này đã xong! Đang chuyển bài...";
             return;
         }
 
-        // 1. Quét nội dung trang web để lấy câu hỏi
-        string jsGetContent = @"
+        _isHandlingDiscussion = true;
+        try
+        {
+            _viewModel.StatusText = "🗣️ Đang xử lý bài Thảo luận (Discussion Prompt)...";
+            await Task.Delay(3000);
+
+            // A submitted discussion is not a fresh prompt.  Coursera can keep
+            // it visually incomplete for a short time, which previously caused
+            // the whole submitted page to be sent to AgentRouter unnecessarily.
+            if (await TryAdvanceSubmittedDiscussionAsync())
+            {
+                return;
+            }
+
+            await DismissAnyGlobalPopupsAsync();
+            if (await TryAdvanceSubmittedDiscussionAsync())
+            {
+                return;
+            }
+
+            if (await CheckLessonCompletedAndClickNextAsync())
+            {
+                _viewModel.StatusText = "⏭️ Bài Thảo luận này đã xong! Đang chuyển bài...";
+                return;
+            }
+
+            // Check once more after the generic Next probe, because React can
+            // render the submission confirmation and Next control separately.
+            if (await TryAdvanceSubmittedDiscussionAsync())
+            {
+                return;
+            }
+
+            // Discussion prompts use a short local reply.  They never need to
+            // send the entire page to AgentRouter, so a provider-side block
+            // cannot stop a course that only needs this acknowledgement.
+            bool isOptional = await IsOptionalDiscussionAsync();
+            _viewModel.StatusText = isOptional
+                ? "📝 Bài thảo luận tùy chọn; đang đăng phản hồi ngắn..."
+                : "📝 Đang đăng phản hồi ngắn cho bài thảo luận...";
+            if (!await PostDiscussionReplyAsync(DefaultDiscussionReply))
+            {
+                await FailCourseJobAsync(
+                    "❌ Không thể đăng phản hồi ngắn cho bài thảo luận.");
+            }
+        }
+        finally
+        {
+            _isHandlingDiscussion = false;
+        }
+    }
+
+    private async Task<bool> TryAdvanceSubmittedDiscussionAsync()
+    {
+        Uri? discussionUri = MainWebView.Source;
+        if (!IsCourseraUri(discussionUri))
+        {
+            return false;
+        }
+
+        string expectedUrlJson = JsonSerializer.Serialize(discussionUri!.ToString());
+        string script = $$"""
             (function() {
-                var container = document.querySelector('.rc-LessonCollectionBody') || document.body;
-                return container.innerText;
-            })();
-        ";
-        
-        string pageContent = await MainWebView.ExecuteScriptAsync(jsGetContent);
-        if (string.IsNullOrEmpty(pageContent) || pageContent == "null") return;
+                const expected = new URL({{expectedUrlJson}});
+                const current = new URL(location.href);
+                if (current.origin !== expected.origin ||
+                    current.pathname !== expected.pathname ||
+                    current.search !== expected.search) {
+                    return 'STALE_DOCUMENT';
+                }
 
-        // 2. Nhờ AI viết bài
-        _viewModel.StatusText = "🧠 Đang nhờ AI viết bài thảo luận (English)...";
-        AiCompletionResult aiResult = await GetAnswerFromAiAsync(pageContent, isDiscussion: true);
-        
-        if (!aiResult.Success)
+                const normalize = value => String(value || '')
+                    .replace(/\u00a0/g, ' ')
+                    .replace(/\s+/g, ' ')
+                    .trim()
+                    .toLowerCase();
+                const isVisible = element => !!element &&
+                    element.getClientRects().length > 0 &&
+                    window.getComputedStyle(element).display !== 'none' &&
+                    window.getComputedStyle(element).visibility !== 'hidden' &&
+                    Number.parseFloat(window.getComputedStyle(element).opacity || '1') > 0 &&
+                    !element.closest('[aria-hidden="true"]') &&
+                    !element.closest('[inert]');
+                const isEnabled = element => !element.matches(':disabled') &&
+                    !element.closest('[aria-disabled="true"], [disabled]') &&
+                    normalize(element.getAttribute('aria-disabled')) !== 'true';
+                const controls = Array.from(document.querySelectorAll(
+                    'button, a, [role="button"]'));
+                const textOf = element => normalize(
+                    element.getAttribute('aria-label') ||
+                    element.getAttribute('title') ||
+                    element.innerText ||
+                    element.textContent);
+                const pageText = normalize(document.body?.innerText);
+                const hasSubmissionConfirmation =
+                    /your\s+(?:response|reply)\s+has\s+been\s+submitted|response\s+has\s+been\s+submitted|đã\s+gửi\s+(?:phản\s+hồi|câu\s+trả\s+lời)/i.test(pageText);
+                const hasViewResponse = controls.some(element => {
+                    const text = textOf(element);
+                    return text === 'view my response' || text === 'view your response' ||
+                        text === 'view response';
+                });
+                const hasEditableReply = Array.from(document.querySelectorAll(
+                    '[role="textbox"], textarea, [contenteditable="true"]'))
+                    .some(element => isVisible(element) &&
+                        /your\s+reply|reply|response/i.test(
+                            element.getAttribute('aria-label') || ''));
+                if (!hasSubmissionConfirmation &&
+                    !(hasViewResponse && !hasEditableReply)) {
+                    return 'NOT_SUBMITTED';
+                }
+
+                const next = controls.find(element =>
+                    textOf(element) === 'go to next item' &&
+                    isVisible(element) && isEnabled(element));
+                if (!next) {
+                    return 'SUBMITTED_NO_NEXT';
+                }
+
+                next.click();
+                return 'CLICKED';
+            })();
+            """;
+
+        string result;
+        try
         {
-            _viewModel.StatusText = "❌ Lỗi AI: " + aiResult.UserMessage;
-            return;
+            result = DecodeWebViewString(await MainWebView.ExecuteScriptAsync(script));
+        }
+        catch
+        {
+            return false;
         }
 
-        string aiResponse = aiResult.Content;
+        if (string.Equals(result, "NOT_SUBMITTED", StringComparison.Ordinal))
+        {
+            return false;
+        }
 
-        // 3. Dùng CDP (Chrome DevTools Protocol) để giả lập gõ phím ở cấp độ Trình duyệt
-        _viewModel.StatusText = "⌨️ Đang giả lập gõ phím để vượt qua React...";
+        if (string.Equals(result, "STALE_DOCUMENT", StringComparison.Ordinal))
+        {
+            // Do not let a stale event use AI on a newer document.
+            return true;
+        }
 
+        _courseHasSubmittedDiscussionItems = true;
+        _submittedDiscussionPaths.Add(discussionUri.AbsolutePath);
+
+        if (string.Equals(result, "CLICKED", StringComparison.Ordinal))
+        {
+            _viewModel.StatusText =
+                "⏭️ Phản hồi Discussion đã gửi; đang chuyển ngay sang bài tiếp theo...";
+            if (await WaitForAppItemNavigationAsync(
+                    discussionUri,
+                    TimeSpan.FromSeconds(2)) ||
+                !IsSameCourseraDocument(discussionUri))
+            {
+                return true;
+            }
+        }
+
+        // Some submitted discussions do not expose a Next button.  Return to
+        // the canonical course page; its scanner excludes this exact path so
+        // it will continue with the next eligible lesson instead of looping.
+        if (IsSameCourseraDocument(discussionUri) &&
+            TryGetCourseHomeUri(discussionUri, out Uri? courseHomeUri) &&
+            courseHomeUri != null)
+        {
+            MainWebView.Source = courseHomeUri;
+            _viewModel.StatusText =
+                "⏭️ Phản hồi Discussion đã gửi; đang quét ngay bài tiếp theo...";
+        }
+        else if (IsSameCourseraDocument(discussionUri))
+        {
+            _viewModel.StatusText =
+                "✅ Phản hồi Discussion đã gửi; Worker sẽ không gọi AI hoặc đăng lại bài này.";
+        }
+
+        return true;
+    }
+
+    private async Task<bool> PostDiscussionReplyAsync(string reply)
+    {
+        // Dùng CDP để React nhận đúng sự kiện nhập liệu của editor.
+        _viewModel.StatusText = "⌨️ Đang nhập phản hồi thảo luận...";
         string jsFocus = @"
             (function() {
                 var editor = document.querySelector('div[role=""textbox""][aria-label=""Your Reply""]');
@@ -5312,17 +8057,17 @@ public partial class MainWindow : Window
                 return 'NOT_FOUND';
             })();
         ";
-        await MainWebView.ExecuteScriptAsync(jsFocus);
+        string focusResult = DecodeWebViewString(await MainWebView.ExecuteScriptAsync(jsFocus));
+        if (!string.Equals(focusResult, "OK", StringComparison.Ordinal))
+        {
+            return false;
+        }
 
-        // Gõ phím thực sự qua CDP (Tuyệt chiêu phá vỡ mọi lớp phòng ngự của React)
-        var payload = new { text = aiResponse + " " }; 
+        var payload = new { text = reply.Trim() + " " };
         string jsonPayload = JsonSerializer.Serialize(payload);
         await MainWebView.CoreWebView2.CallDevToolsProtocolMethodAsync("Input.insertText", jsonPayload);
-        
-        // Nghỉ 1 giây để React (Slate JS) kịp cập nhật state và kích hoạt nút Reply
         await Task.Delay(1000);
 
-        // 4. Tìm và bấm nút Reply
         string jsClickReply = @"
             (function() {
                 var btns = Array.from(document.querySelectorAll('button'));
@@ -5334,494 +8079,498 @@ public partial class MainWindow : Window
                 return 'FAILED';
             })();
         ";
-        await MainWebView.ExecuteScriptAsync(jsClickReply);
+        string replyResult = DecodeWebViewString(await MainWebView.ExecuteScriptAsync(jsClickReply));
+        if (!string.Equals(replyResult, "SUCCESS", StringComparison.Ordinal))
+        {
+            return false;
+        }
 
         _viewModel.StatusText = "✅ Đã đăng bài thảo luận! Đang tải lại trang để xác nhận...";
-        
-        // Đợi 3 giây cho Server của Coursera kịp lưu bài
         await Task.Delay(3000);
-        
-        // F5 Tải lại trang (Reload)
         MainWebView.CoreWebView2.Reload();
-        
-        // KẾT THÚC HÀM Ở ĐÂY. 
-        // Khi trang tải lại xong, sự kiện NavigationCompleted sẽ tự động mồi lại hàm này.
-        // Nhưng ở lần chạy thứ 2, nút Next đã màu xanh -> Nó sẽ chui vào lệnh if đầu tiên và bấm Next chuyển bài!
+        return true;
     }
 
-    private async Task HandleReadingLessonAsync()
+    private async Task<bool> IsOptionalDiscussionAsync()
     {
-        if (await CheckForLockedScreenAndReloadAsync()) return;
-
-        _viewModel.StatusText = "📖 Đang xử lý bài Đọc (Reading)...";
-        await Task.Delay(2000); 
-        await DismissAnyGlobalPopupsAsync();
-
-        // 1. Kiểm tra nếu đã xong từ trước
-        if (await CheckLessonCompletedAndClickNextAsync())
-        {
-            _viewModel.StatusText = "⏭️ Tài liệu này đã đọc xong! Đang chuyển bài...";
-            return;
-        }
-
-        bool isCompleted = false;
-
-        // Vòng lặp chờ hoặc tương tác để hoàn thành bài đọc
-        while (!isCompleted)
-        {
-            // Đóng các popup chắn màn hình (nếu có).
-            await DismissAnyGlobalPopupsAsync(maxPasses: 2);
-
-            // Cuộn trang xuống cuối cùng (Giả lập hành vi đọc kéo chuột)
-            await MainWebView.ExecuteScriptAsync("window.scrollTo(0, document.body.scrollHeight);");
-            
-            // Một số bài đọc trên Coursera có nút "Mark as completed" ở cuối trang
-            string clickMarkCompletedJs = @"
-                (function() {
-                    var btns = Array.from(document.querySelectorAll('button'));
-                    var markBtn = btns.find(b => (b.innerText || '').trim() === 'Mark as completed');
-                    if (markBtn && !markBtn.disabled) {
-                        markBtn.click();
-                    }
-                })();
-            ";
-            await MainWebView.ExecuteScriptAsync(clickMarkCompletedJs);
-
-            // Đợi 2 giây
-            await Task.Delay(2000);
-
-            // Kiểm tra xem nút Next Coursera đã xanh chưa
-            isCompleted = await CheckLessonCompletedAndClickNextAsync();
-            if (isCompleted) break;
-        }
-
-        _viewModel.StatusText = "✅ Đã đọc xong tài liệu! Chuyển bài.";
-    }
-
-
-    private async Task HandlePeerAssignmentAsync()
-    {
-        _viewModel.StatusText = "✍️ Đang xử lý bài tập tự luận chấm chéo (Peer-graded)...";
-        await Task.Delay(3000);
-        
-        if (await CheckForLockedScreenAndReloadAsync()) return;
-        
-        await DismissAnyGlobalPopupsAsync();
-
-        if (await CheckLessonCompletedAndClickNextAsync())
-        {
-            _viewModel.StatusText = "⏭️ Bài tập này đã làm xong! Đang chuyển bài...";
-            return;
-        }
-
-        // Tạm thời tự động chuyển sang tab "My submission" nếu có
-        string jsSwitchTab = @"
+        const string script = """
             (function() {
-                var tabs = Array.from(document.querySelectorAll('[role=""tab""], button, a, div, span, li'));
-                var subTab = tabs.find(b => (b.innerText || b.textContent || '').trim().toLowerCase() === 'my submission');
-                if (subTab) {
-                    subTab.click();
-                    return 'CLICKED';
-                }
-                return 'NOT_FOUND';
+                const normalize = value => String(value || '')
+                    .replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
+                const pageText = normalize(document.body?.innerText || '');
+                return /participation\s+is\s+optional|optional\s+participation/i.test(pageText);
             })();
-        ";
-        
-        bool tabClicked = false;
-        for (int i = 0; i < 5; i++)
-        {
-            string res = await MainWebView.ExecuteScriptAsync(jsSwitchTab);
-            if (res != null && res.Contains("CLICKED"))
-            {
-                tabClicked = true;
-                break;
-            }
-            await Task.Delay(1000);
-        }
-        
-        await Task.Delay(2000); // Chờ giao diện tab render
-        await SolvePeerAssignmentAsync();
-    }
-
-    public class PeerAssignmentPartDto
-    {
-        public string Id { get; set; }
-        public string Prompt { get; set; }
-        public bool IsTitle { get; set; }
-        public int Index { get; set; }
-    }
-
-    private async Task SolvePeerAssignmentAsync()
-    {
-        _viewModel.StatusText = "🔍 Đang quét đề bài Tự luận...";
-
-        string jsExtract = @"
-            (function() {
-                var parts = [];
-                
-                var titleInput = document.getElementById('title');
-                if (titleInput) {
-                    parts.push({ Id: 'title', Prompt: 'Write ONE short creative phrase (max 5 words) as a title for a project about the future.', IsTitle: true, Index: -1 });
-                }
-
-                var qElements = document.querySelectorAll('.rc-SubmissionPartEditView');
-                qElements.forEach((q, index) => {
-                    var promptEl = q.querySelector('div[data-testid=""cml-viewer""]');
-                    var questionText = promptEl ? promptEl.innerText.trim() : '';
-                    
-                    var editor = q.querySelector('div[role=""textbox""]');
-                    if (editor && questionText) {
-                        parts.push({ Id: 'editor_' + index, Prompt: questionText, IsTitle: false, Index: index });
-                    }
-                });
-
-                return JSON.stringify(parts);
-            })();
-        ";
-
-        string rawResult = await MainWebView.ExecuteScriptAsync(jsExtract);
-        if (string.IsNullOrEmpty(rawResult) || rawResult == "null" || rawResult.Contains("[]"))
-        {
-            _viewModel.StatusText = "⚠️ Không tìm thấy khung điền bài nào. Có thể đang ở tab khác hoặc khóa học cấm nộp.";
-            return;
-        }
-
-        string json = System.Text.RegularExpressions.Regex.Unescape(rawResult.Substring(1, rawResult.Length - 2));
-        var partList = System.Text.Json.JsonSerializer.Deserialize<List<PeerAssignmentPartDto>>(json);
-
-        if (partList == null || partList.Count == 0)
-        {
-            _viewModel.StatusText = "⚠️ Không tìm thấy khung điền bài nào. Chuyển JSON thất bại.";
-            return;
-        }
-
-        _viewModel.StatusText = $"🤖 Đã gom được {partList.Count} câu hỏi! Đang gửi cho AI...";
-
-        foreach (var part in partList)
-        {
-            AiCompletionResult aiResult;
-            if (part.IsTitle)
-            {
-                aiResult = await GetAnswerFromAiAsync(part.Prompt, false, "You are a creative writer. Reply with ONLY the title. No quotes, no markdown, no explanation.");
-            }
-            else
-            {
-                aiResult = await GetAnswerFromAiAsync(part.Prompt, true);
-            }
-
-            if (!aiResult.Success)
-            {
-                _viewModel.StatusText = "❌ Lỗi AI: " + aiResult.UserMessage;
-                return;
-            }
-
-            string aiResponse = aiResult.Content;
-            aiResponse = aiResponse.Replace("```", "").Replace("\"", "").Trim();
-
-            string jsFocus = $@"
-                (function() {{
-                    var el = null;
-                    if ('{part.IsTitle}' === 'True') {{
-                        el = document.getElementById('title');
-                    }} else {{
-                        var parts = document.querySelectorAll('.rc-SubmissionPartEditView');
-                        if ({part.Index} < parts.length) {{
-                            el = parts[{part.Index}].querySelector('div[role=""textbox""]');
-                        }}
-                    }}
-
-                    if (el) {{
-                        el.focus();
-                        if (el.tagName === 'DIV') {{
-                            var s = window.getSelection();
-                            var r = document.createRange();
-                            r.selectNodeContents(el);
-                            s.removeAllRanges();
-                            s.addRange(r);
-                            document.execCommand('delete', false, null);
-                        }} else {{
-                            var proto = el.tagName === 'INPUT' ? window.HTMLInputElement.prototype : window.HTMLTextAreaElement.prototype;
-                            var nativeSetter = Object.getOwnPropertyDescriptor(proto, 'value').set;
-                            if (nativeSetter) {{
-                                nativeSetter.call(el, '');
-                            }} else {{
-                                el.value = '';
-                            }}
-                            el.dispatchEvent(new Event('input', {{ bubbles: true }}));
-                            
-                            // Dự phòng select All
-                            el.select();
-                            document.execCommand('delete', false, null);
-                        }}
-                        
-                        return 'OK';
-                    }}
-                    return 'NOT_FOUND';
-                }})();
-            ";
-            await MainWebView.ExecuteScriptAsync(jsFocus);
-
-            var payload = new { text = aiResponse + " " };
-            string jsonPayload = System.Text.Json.JsonSerializer.Serialize(payload);
-            await MainWebView.CoreWebView2.CallDevToolsProtocolMethodAsync("Input.insertText", jsonPayload);
-            
-            await Task.Delay(1500); 
-        }
-
-        _viewModel.StatusText = "🚀 Đang ký tên Honor Code và Submit...";
-
-        string jsSubmit = @"
-            (function() {
-                var honorCode = document.getElementById('agreement-checkbox-base');
-                if (honorCode && !honorCode.checked) {
-                    honorCode.click();
-                }
-                
-                var btns = Array.from(document.querySelectorAll('button'));
-                var submitBtn = document.querySelector('button[data-testid=""preview""]') || btns.find(b => (b.innerText || '').trim().toLowerCase() === 'submit');
-                if (submitBtn && !submitBtn.disabled) {
-                    submitBtn.click();
-                }
-            })();
-        ";
-        await MainWebView.ExecuteScriptAsync(jsSubmit);
-        
-        await Task.Delay(2000);
-        
-        string confirmStatus = await ConfirmOwnedCourseraSubmissionAsync();
-        if (confirmStatus != "CLICKED")
-        {
-            _viewModel.StatusText = $"⚠️ Không xác nhận được popup nộp bài ({confirmStatus}).";
-            return;
-        }
-
-        _viewModel.StatusText = "🏆 Đã nộp bài Tự luận! Đang chờ Coursera xử lý...";
-        
-        // Chờ Coursera xử lý submit (KHÔNG reload trang)
-        // Chỉ đợi DOM cập nhật và check sidebar có tick xanh chưa
-        for (int waitLoop = 0; waitLoop < 10; waitLoop++)
-        {
-            await Task.Delay(3000);
-            
-            // Check sidebar xem bài đã có tick xanh chưa
-            string jsCheckSidebar = @"
-                (function() {
-                    // Tìm item đang active trong sidebar
-                    var items = document.querySelectorAll('a[data-click-key*=""item_link""]');
-                    for (var i = 0; i < items.length; i++) {
-                        var html = items[i].innerHTML;
-                        if (items[i].getAttribute('aria-current') === 'page' || items[i].classList.contains('rc-ItemLink--active')) {
-                            if (html.includes('>Completed<')) {
-                                return 'COMPLETED';
-                            }
-                        }
-                    }
-                    
-                    // Cách 2: Check text trên body
-                    var bodyText = document.body.innerText;
-                    if (bodyText.includes('Grade: 100%') || bodyText.includes('Your grade') || bodyText.includes('Submission confirmed')) {
-                        return 'COMPLETED';
-                    }
-                    
-                    return 'WAITING';
-                })();
-            ";
-            
-            try
-            {
-                string sidebarResult = await MainWebView.ExecuteScriptAsync(jsCheckSidebar);
-                if (sidebarResult != null && sidebarResult.Contains("COMPLETED"))
-                {
-                    _viewModel.StatusText = "✅ Bài tự luận đã được chấp nhận! Tick xanh rồi!";
-                    await Task.Delay(1000);
-                    await CheckLessonCompletedAndClickNextAsync();
-                    return;
-                }
-            }
-            catch { }
-            
-            _viewModel.StatusText = $"⏳ Đang chờ Coursera xác nhận bài nộp... ({(waitLoop + 1) * 3}s)";
-        }
-        
-        // Nếu chờ 30s mà chưa thấy tick xanh → thử bấm Next
-        _viewModel.StatusText = "⏭️ Đã chờ đủ lâu. Thử chuyển bài...";
-        await CheckLessonCompletedAndClickNextAsync();
-    }
-
-    private bool _isHandlingPeerReview = false;
-
-    private async Task HandlePeerReviewAsync()
-    {
-        if (_isHandlingPeerReview) return;
-        _isHandlingPeerReview = true;
+            """;
 
         try
         {
-            _viewModel.StatusText = "👀 Đang tự động chấm điểm cho bạn cùng lớp (Peer Review)...";
-            await Task.Delay(3000);
-            
-            int reviewCount = 0;
-            int maxReviews = 5; // Giới hạn tối đa, thường chỉ cần 3
-            bool isAllDone = false;
-            
-            while (!isAllDone && reviewCount < maxReviews)
+            string result = DecodeWebViewString(await MainWebView.ExecuteScriptAsync(script));
+            return string.Equals(result, "true", StringComparison.OrdinalIgnoreCase);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    // A Reading can raise both SourceChanged and NavigationCompleted. A pending
+    // flag (in addition to the guard) preserves a second Reading reached while
+    // the first handler is still unwinding.
+    private bool _isHandlingReading;
+    private bool _readingHandlerRequested;
+
+    private async Task HandleReadingLessonAsync()
+    {
+        _readingHandlerRequested = true;
+        if (_isHandlingReading)
+        {
+            return;
+        }
+
+        _isHandlingReading = true;
+        try
+        {
+            while (_readingHandlerRequested)
             {
-                await DismissAnyGlobalPopupsAsync();
-
-                // CHECK SIDEBAR CÓ TICK XANH CHƯA (Hoàn thành = Dừng ngay)
-                string jsCheckCompleted = @"
-                    (function() {
-                        var bodyText = document.body.innerText.toLowerCase();
-                        
-                        // Cách 1: Check sidebar item đang active
-                        var items = document.querySelectorAll('a[data-click-key*=""item_link""]');
-                        for (var i = 0; i < items.length; i++) {
-                            if (items[i].getAttribute('aria-current') === 'page' || items[i].classList.contains('rc-ItemLink--active')) {
-                                if (items[i].innerHTML.includes('>Completed<')) {
-                                    return 'COMPLETED';
-                                }
-                            }
-                        }
-                        
-                        // Cách 2: Check active item trong sidebar bằng aria-label
-                        var activeItem = document.querySelector('a[data-testid=""rc-WeekNavigationItem""][aria-current=""page""]');
-                        var isSidebarCompleted = activeItem && activeItem.getAttribute('aria-label') && activeItem.getAttribute('aria-label').includes('Completed');
-                        
-                        if (isSidebarCompleted || 
-                            bodyText.includes('0 left to complete') || 
-                            bodyText.includes('you have completed all required reviews') || 
-                            bodyText.includes(""you've finished your peer reviews"") ||
-                            bodyText.includes(""you have finished your peer reviews"")) 
-                        {
-                            return 'COMPLETED';
-                        }
-                        return 'NOT_YET';
-                    })();
-                ";
-                string checkResult = await MainWebView.ExecuteScriptAsync(jsCheckCompleted);
-                if (checkResult != null && checkResult.Contains("COMPLETED"))
+                _readingHandlerRequested = false;
+                Uri? readingUri = MainWebView.Source;
+                if (!IsCourseraUri(readingUri) ||
+                    !readingUri!.AbsolutePath.Contains(
+                        "/supplement/",
+                        StringComparison.OrdinalIgnoreCase))
                 {
-                    _viewModel.StatusText = "✅ Sidebar đã tick xanh! Đã chấm đủ số lượng bài yêu cầu!";
-                    isAllDone = true;
-                    // Bấm Next để qua bài
-                    await CheckLessonCompletedAndClickNextAsync();
-                    break;
+                    continue;
                 }
 
-                // Bước 1: Bấm Start Reviewing
-                string jsStart = @"
-                    (function() {
-                        var btns = Array.from(document.querySelectorAll('button, a'));
-                        var startBtn = btns.find(b => {
-                            var text = (b.innerText || b.textContent || '').trim().toLowerCase();
-                            return text === 'start reviewing' || text === 'review fellow learners';
-                        });
-                        if (startBtn && !startBtn.disabled) {
-                            startBtn.click();
-                            return 'CLICKED_START';
-                        }
-                        return 'NO_START';
-                    })();
-                ";
-                string resultStart = await MainWebView.ExecuteScriptAsync(jsStart);
-                
-                if (resultStart != null && resultStart.Contains("CLICKED_START"))
-                {
-                    _viewModel.StatusText = $"👀 Đang mở bài #{reviewCount + 1} của bạn cùng lớp...";
-                    await Task.Delay(4000); 
-                }
-
-                // Bước 2: Chấm điểm (Chọn max điểm) và điền lời khen
-                string jsGrade = @"
-                    (function() {
-                        var actionTaken = false;
-
-                        // Chọn điểm cao nhất cho mỗi Rubric
-                        var groups = document.querySelectorAll('div[role=""radiogroup""]');
-                        groups.forEach(g => {
-                            var radios = g.querySelectorAll('input[type=""radio""]');
-                            if (radios.length > 0) {
-                                var targetRadio = radios[radios.length - 1];
-                                if (!targetRadio.checked) {
-                                    targetRadio.click();
-                                    actionTaken = true;
-                                }
-                            }
-                        });
-
-                        // Tìm và điền Textarea bằng tuyệt chiêu lừa React 16+
-                        var textboxes = document.querySelectorAll('textarea');
-                        for (var i = 0; i < textboxes.length; i++) {
-                            var tb = textboxes[i];
-                            if (!tb.value || tb.value.trim() === '') {
-                                var msg = 'Great job on this assignment! Your responses were well-thought-out and covered all the necessary points. Keep up the good work!';
-                                
-                                let lastValue = tb.value;
-                                tb.value = msg;
-                                let event = new Event('input', { bubbles: true });
-                                event.simulated = true;
-                                let tracker = tb._valueTracker;
-                                if (tracker) {
-                                    tracker.setValue(lastValue);
-                                }
-                                tb.dispatchEvent(event);
-                                tb.dispatchEvent(new Event('change', { bubbles: true }));
-                                tb.dispatchEvent(new Event('blur', { bubbles: true }));
-                                
-                                actionTaken = true;
-                            }
-                        }
-                        
-                        var btns = Array.from(document.querySelectorAll('button'));
-                        var submitBtn = btns.find(b => {
-                            var text = (b.innerText || b.textContent || '').trim().toLowerCase();
-                            return text === 'submit review' || text === 'submit';
-                        });
-
-                        if (submitBtn && !submitBtn.disabled) {
-                            submitBtn.click();
-                            return 'SUBMITTED';
-                        }
-                        
-                        return actionTaken ? 'GRADED' : 'NO_ACTION';
-                    })();
-                ";
-                string gradeResult = await MainWebView.ExecuteScriptAsync(jsGrade);
-                
-                if (gradeResult != null && gradeResult.Contains("SUBMITTED"))
-                {
-                    reviewCount++;
-                    _viewModel.StatusText = $"✅ Đã nộp phiếu #{reviewCount}! Chờ Coursera xử lý...";
-                    await Task.Delay(5000); // Chờ React render
-                    
-                    // SAU KHI SUBMIT: Check sidebar ngay lập tức
-                    string recheck = await MainWebView.ExecuteScriptAsync(jsCheckCompleted);
-                    if (recheck != null && recheck.Contains("COMPLETED"))
-                    {
-                        _viewModel.StatusText = $"✅ Đã chấm {reviewCount} bài, sidebar tick xanh rồi! Qua bài tiếp!";
-                        isAllDone = true;
-                        await CheckLessonCompletedAndClickNextAsync();
-                        break;
-                    }
-                }
-                else
-                {
-                    _viewModel.StatusText = "⏳ Đã điền xong nhưng nút Submit chưa bấm được. Chờ thêm...";
-                    await Task.Delay(2000);
-                }
-            } // Kết thúc vòng lặp while
-            
-            // Nếu đã chấm max bài mà vẫn chưa tick xanh → dừng lại, thử bấm Next
-            if (!isAllDone)
-            {
-                _viewModel.StatusText = $"⚠️ Đã chấm {reviewCount}/{maxReviews} bài. Thử chuyển bài...";
-                await CheckLessonCompletedAndClickNextAsync();
+                await HandleSingleReadingLessonAsync(readingUri);
             }
-
         }
         finally
         {
-            _isHandlingPeerReview = false;
+            _isHandlingReading = false;
+        }
+    }
+
+    private async Task HandleSingleReadingLessonAsync(Uri readingUri)
+    {
+        if (await CheckForLockedScreenAndReloadAsync())
+        {
+            return;
+        }
+
+        _viewModel.StatusText = "📖 Đang xử lý bài Đọc (Reading)...";
+        await Task.Delay(2000);
+        if (!IsSameCourseraDocument(readingUri))
+        {
+            return;
+        }
+
+        bool completionReloadAttempted = false;
+        bool completionReloadVerified = false;
+        string lastProbeState = "NOT_STARTED";
+
+        // A transient React render must not become an endless course loop. Eight
+        // bounded probes give Coursera time to persist the completion state.
+        for (int attempt = 1; attempt <= 8; attempt++)
+        {
+            await DismissAnyGlobalPopupsAsync(maxPasses: 2);
+            if (!IsSameCourseraDocument(readingUri))
+            {
+                return;
+            }
+
+            string state = await ProbeAndAdvanceReadingAsync(
+                readingUri,
+                completionReloadVerified);
+            lastProbeState = state;
+
+            if (state == "STALE_DOCUMENT")
+            {
+                return;
+            }
+
+            if (state == "COMPLETED_NEXT_CLICKED")
+            {
+                _viewModel.StatusText =
+                    "✅ Đã xác nhận bài Reading hoàn thành; đang mở bài kế tiếp...";
+                if (await WaitForAppItemNavigationAsync(
+                        readingUri,
+                        TimeSpan.FromSeconds(3)))
+                {
+                    return;
+                }
+
+                // The exact Next click was swallowed by React. Completion is
+                // already proven, so Course Home is now a safe fallback.
+                if (TryReturnToCourseHomeAfterReading(
+                        readingUri,
+                        "✅ Reading đã hoàn thành nhưng nút Next không chuyển trang; đang quét phần còn lại..."))
+                {
+                    return;
+                }
+
+                await FailCourseJobAsync(
+                    "❌ Reading đã hoàn thành nhưng không xác định được trang khóa học để tiếp tục.");
+                return;
+            }
+
+            if (state == "COMPLETED_NO_NEXT")
+            {
+                // In the final Reading Coursera shows "Go to My Learning". That
+                // link is deliberately not treated as Next.
+                if (TryReturnToCourseHomeAfterReading(
+                        readingUri,
+                        "✅ Đã đánh dấu Reading cuối là hoàn thành; đang kiểm tra kết thúc khóa học..."))
+                {
+                    return;
+                }
+
+                await FailCourseJobAsync(
+                    "❌ Reading đã hoàn thành nhưng không xác định được trang khóa học để kết thúc.");
+                return;
+            }
+
+            if (state == "MARK_CLICKED")
+            {
+                completionReloadAttempted = false;
+                completionReloadVerified = false;
+                _viewModel.StatusText =
+                    $"📖 Đã bấm Mark as completed; đang xác nhận với Coursera ({attempt}/8)...";
+            }
+            else if (state == "NO_MARK" && !completionReloadAttempted)
+            {
+                completionReloadAttempted = true;
+                _viewModel.StatusText =
+                    "📖 Nút Mark đã biến mất; đang tải lại chính bài Reading để xác nhận đã lưu...";
+                completionReloadVerified =
+                    await ReloadReadingForCompletionVerificationAsync(readingUri);
+                if (!IsSameCourseraDocument(readingUri))
+                {
+                    return;
+                }
+            }
+            else
+            {
+                _viewModel.StatusText =
+                    $"📖 Đang chờ nút Mark as completed sẵn sàng ({attempt}/8)...";
+            }
+
+            await Task.Delay(1250);
+        }
+
+        await FailCourseJobAsync(
+            "❌ Không xác nhận được bài Reading đã hoàn thành; Worker đã dừng để tránh lặp vô hạn. " +
+            $"Trạng thái cuối: {lastProbeState}.");
+    }
+
+    private async Task<string> ProbeAndAdvanceReadingAsync(
+        Uri readingUri,
+        bool completionReloadVerified)
+    {
+        string expectedUrlJson = JsonSerializer.Serialize(readingUri.ToString());
+        string script = """
+            (function() {
+                const expected = new URL(__EXPECTED_URL__);
+                const current = new URL(window.location.href);
+                if (current.origin !== expected.origin ||
+                    current.pathname !== expected.pathname ||
+                    current.search !== expected.search) {
+                    return 'STALE_DOCUMENT';
+                }
+
+                window.scrollTo(0, document.body.scrollHeight);
+                const normalize = value => String(value || '')
+                    .replace(/\u00a0/g, ' ')
+                    .replace(/\s+/g, ' ')
+                    .trim()
+                    .toLowerCase();
+                const isVisible = element => !!element &&
+                    element.getClientRects().length > 0 &&
+                    window.getComputedStyle(element).display !== 'none' &&
+                    window.getComputedStyle(element).visibility !== 'hidden' &&
+                    Number.parseFloat(window.getComputedStyle(element).opacity || '1') > 0 &&
+                    !element.closest('[aria-hidden="true"], [inert]');
+                const isEnabled = element => !element.matches(':disabled') &&
+                    !element.closest('[disabled], [aria-disabled="true"]') &&
+                    normalize(element.getAttribute('aria-disabled')) !== 'true';
+                const accessibleName = element => normalize(
+                    element.getAttribute('aria-label') ||
+                    element.getAttribute('title') ||
+                    element.innerText ||
+                    element.textContent);
+                const controls = Array.from(document.querySelectorAll(
+                    'button, a[href], [role="button"]'));
+                const visibleControls = controls.filter(isVisible);
+                const enabledControls = visibleControls.filter(isEnabled);
+                const markCompletedNames = new Set([
+                    'mark as completed',
+                    'mark as complete',
+                    'đánh dấu là đã hoàn thành',
+                    'đánh dấu hoàn thành'
+                ]);
+                const markIncompleteNames = new Set([
+                    'mark as incomplete',
+                    'đánh dấu là chưa hoàn thành'
+                ]);
+                const visibleText = element => normalize(
+                    element.innerText || element.textContent);
+                const markButton = visibleControls.find(element =>
+                    (element.matches('button') || element.getAttribute('role') === 'button') &&
+                    (markCompletedNames.has(accessibleName(element)) ||
+                        markCompletedNames.has(visibleText(element))));
+                const markIncomplete = visibleControls.find(element =>
+                    markIncompleteNames.has(accessibleName(element)) ||
+                    markIncompleteNames.has(visibleText(element)));
+
+                // Coursera has used several wrappers for the outline item. The
+                // canonical href is stable, so select from all anchors but only
+                // accept the one whose origin + pathname exactly matches this
+                // Reading document. This cannot confuse a global current link.
+                const lessonLinks = Array.from(document.querySelectorAll('a[href]'));
+                const activeLesson = lessonLinks.find(link => {
+                    try {
+                        const linkUrl = new URL(
+                            link.getAttribute('href') || '',
+                            window.location.href);
+                        return linkUrl.origin === current.origin &&
+                            linkUrl.pathname === current.pathname;
+                    } catch (_) {
+                        return false;
+                    }
+                });
+                const activeContainer = activeLesson?.closest(
+                    'li[data-testid^="WeekSingleItemDisplay"]') || activeLesson;
+                const activeLabel = normalize(
+                    activeLesson?.getAttribute('aria-label') ||
+                    activeLesson?.innerText);
+                const activeCompletionMarker = !!activeContainer && (
+                    /\bcompleted\b/.test(activeLabel) ||
+                    !!activeContainer.querySelector(
+                        '[aria-label*="Completed" i], [data-testid*="completed" i]') ||
+                    Array.from(activeContainer.querySelectorAll('span')).some(span =>
+                        normalize(span.textContent) === 'completed') ||
+                    !!activeLesson?.querySelector(':scope > span:first-child > svg'));
+                const explicitCompletedControl = visibleControls.some(element => {
+                    const name = accessibleName(element);
+                    return name === 'completed' && (
+                        element.matches(':disabled') ||
+                        normalize(element.getAttribute('aria-disabled')) === 'true' ||
+                        normalize(element.getAttribute('aria-pressed')) === 'true');
+                });
+                const currentCourseMatch = current.pathname.match(
+                    /^\/learn\/([^/]+)(?:\/|$)/i);
+                const myLearningControl = enabledControls.find(element => {
+                    const text = visibleText(element);
+                    const name = accessibleName(element);
+                    const href = element.getAttribute('href') || '';
+                    return text === 'go to my learning' ||
+                        name === 'go to my learning' ||
+                        /(?:^|\/)my-learning(?:\/|$)/i.test(href);
+                });
+                const isTrustedNext = element => {
+                    const visibleText = normalize(
+                        element.innerText || element.textContent);
+                    const rawHref = element.getAttribute('href') || '';
+                    if (visibleText === 'go to my learning' ||
+                        accessibleName(element) === 'go to my learning' ||
+                        /(?:^|\/)my-learning(?:\/|$)/i.test(rawHref)) {
+                        return false;
+                    }
+                    if (accessibleName(element) !== 'go to next item') {
+                        return false;
+                    }
+                    if (!element.matches('a[href]')) {
+                        return true;
+                    }
+                    if (!currentCourseMatch) {
+                        return false;
+                    }
+                    try {
+                        const target = new URL(rawHref, window.location.href);
+                        return target.origin === current.origin &&
+                            target.pathname.startsWith(
+                                '/learn/' + currentCourseMatch[1] + '/');
+                    } catch (_) {
+                        return false;
+                    }
+                };
+                const next = enabledControls.find(isTrustedNext);
+                const primaryNext = !!next &&
+                    /(?:^|\s)cds-button-primary(?:\s|$)/i.test(next.className || '');
+                const completed = activeCompletionMarker ||
+                    !!markIncomplete ||
+                    explicitCompletedControl ||
+                    primaryNext ||
+                    (__COMPLETION_RELOAD_VERIFIED__ &&
+                        !markButton &&
+                        !!myLearningControl);
+
+                if (completed) {
+                    if (next) {
+                        next.click();
+                        return 'COMPLETED_NEXT_CLICKED';
+                    }
+                    return 'COMPLETED_NO_NEXT';
+                }
+
+                if (markButton && isEnabled(markButton)) {
+                    markButton.click();
+                    return 'MARK_CLICKED';
+                }
+                return markButton ? 'MARK_WAITING' : 'NO_MARK';
+            })();
+            """
+            .Replace("__EXPECTED_URL__", expectedUrlJson)
+            .Replace(
+                "__COMPLETION_RELOAD_VERIFIED__",
+                completionReloadVerified ? "true" : "false");
+
+        try
+        {
+            return DecodeWebViewString(
+                await MainWebView.ExecuteScriptAsync(script));
+        }
+        catch
+        {
+            return "DOM_NOT_READY";
+        }
+    }
+
+    private async Task<bool> ReloadReadingForCompletionVerificationAsync(
+        Uri readingUri)
+    {
+        if (!IsSameCourseraDocument(readingUri))
+        {
+            return false;
+        }
+
+        MainWebView.Reload();
+        await Task.Delay(500);
+        for (int attempt = 0; attempt < 20; attempt++)
+        {
+            if (!IsSameCourseraDocument(readingUri))
+            {
+                return false;
+            }
+
+            try
+            {
+                string readyState = DecodeWebViewString(
+                    await MainWebView.ExecuteScriptAsync("document.readyState"));
+                if (string.Equals(
+                        readyState,
+                        "complete",
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    // Give the Reading CTA one bounded React render after the
+                    // persisted document has loaded. If Mark returns, the next
+                    // probe clicks it again instead of claiming completion.
+                    await Task.Delay(2500);
+                    return IsSameCourseraDocument(readingUri);
+                }
+            }
+            catch
+            {
+                // The WebView document is between reload phases.
+            }
+
+            await Task.Delay(250);
+        }
+
+        return false;
+    }
+
+    private bool TryReturnToCourseHomeAfterReading(
+        Uri readingUri,
+        string activity)
+    {
+        if (!IsSameCourseraDocument(readingUri) ||
+            !TryGetCourseHomeUri(readingUri, out Uri? courseHomeUri) ||
+            courseHomeUri == null)
+        {
+            return false;
+        }
+
+        MainWebView.Source = courseHomeUri;
+        _viewModel.StatusText = activity;
+        return true;
+    }
+
+
+    // SourceChanged and NavigationCompleted can both fire for the same Peer page.
+    // Keep this guard around the entire skip so duplicate events cannot start
+    // competing navigation requests back to Course Home.
+    private bool _isHandlingPeerAssignment = false;
+
+    private async Task HandlePeerAssignmentAsync()
+    {
+        if (_isHandlingPeerAssignment)
+        {
+            return;
+        }
+
+        _isHandlingPeerAssignment = true;
+        try
+        {
+            Uri? peerActivityUri = MainWebView.Source;
+            if (!IsCourseraUri(peerActivityUri))
+            {
+                return;
+            }
+
+            // Coursera uses several peer routes.  A review URL can contain
+            // "give-feedback" or "review"; both must be treated as one
+            // intentionally skipped category and never receive clicks, text,
+            // files, Honor Code confirmation, or a submission.
+            bool isPeerReview = peerActivityUri.AbsolutePath.Contains(
+                    "review", StringComparison.OrdinalIgnoreCase) ||
+                peerActivityUri.AbsolutePath.Contains(
+                    "feedback", StringComparison.OrdinalIgnoreCase);
+            string peerActivityName = isPeerReview
+                ? "Peer Review"
+                : "Peer-graded Assignment";
+
+            // Completion reporting uses this course-scoped marker to explain
+            // that Peer-graded/Review items remain intentionally skipped.
+            _courseHasSkippedPeerItems = true;
+
+            if (!TryGetCourseHomeUri(peerActivityUri, out Uri? courseHomeUri) ||
+                courseHomeUri == null)
+            {
+                _viewModel.StatusText =
+                    $"⚠️ Đã phát hiện {peerActivityName} nhưng không xác định được khóa học để bỏ qua an toàn.";
+                return;
+            }
+
+            _viewModel.StatusText =
+                $"⏭️ Đã bỏ qua {peerActivityName}. Đang quay lại danh sách bài để tiếp tục...";
+
+            // Yield once so SourceChanged and NavigationCompleted can settle,
+            // then make sure this is still the very same peer document.  This
+            // prevents a late handler from replacing a newer lesson selected by
+            // the course scanner.
+            await Task.Delay(250);
+            if (!IsSameCourseraDocument(peerActivityUri))
+            {
+                return;
+            }
+
+            // Do not interact with the peer page itself.  Course Home is the
+            // normal scanner entry point, where it can choose the next eligible
+            // lesson.  Navigating there also avoids peer pages that bounce
+            // between the assignment and review tabs.
+            MainWebView.Source = courseHomeUri;
+            _viewModel.StatusText =
+                $"⏭️ Đã bỏ qua {peerActivityName}; đang quét bài tiếp theo trong khóa học...";
+        }
+        catch (Exception ex)
+        {
+            _viewModel.StatusText =
+                "⚠️ Không thể bỏ qua bài Peer-graded an toàn: " + ex.Message;
+        }
+        finally
+        {
+            _isHandlingPeerAssignment = false;
         }
     }
 
@@ -5929,7 +8678,7 @@ public partial class MainWindow : Window
 
     private async void MainWebView_SourceChanged(object sender, Microsoft.Web.WebView2.Core.CoreWebView2SourceChangedEventArgs e)
     {
-        if (_directLoginActive)
+        if (_directLoginActive || IsInteractiveBrowseSession)
         {
             return;
         }
@@ -5965,7 +8714,8 @@ public partial class MainWindow : Window
         {
             await HandleUngradedAppAsync();
         }
-        else if (currenUrl.Contains("/assignment-submission/") || currenUrl.Contains("/exam/") || currenUrl.Contains("/quiz/"))
+        else if (!currenUrl.Contains("/peer/") &&
+                 (currenUrl.Contains("/assignment-submission/") || currenUrl.Contains("/exam/") || currenUrl.Contains("/quiz/")))
         {
             await HandleQuizAsync();
         }
@@ -5979,14 +8729,7 @@ public partial class MainWindow : Window
         }
         else if (currenUrl.Contains("/peer/"))
         {
-            if (currenUrl.Contains("give-feedback") || currenUrl.Contains("review"))
-            {
-                await HandlePeerReviewAsync();
-            }
-            else
-            {
-                await HandlePeerAssignmentAsync();
-            }
+            await HandlePeerAssignmentAsync();
         }
         else if (currenUrl.Contains("/coach/") || currenUrl.Contains("/dialogue/"))
         {
@@ -5998,6 +8741,14 @@ public partial class MainWindow : Window
     {
         if (_directLoginActive)
         {
+            return;
+        }
+
+        if (IsInteractiveBrowseSession)
+        {
+            _viewModel.StatusText = e.IsSuccess
+                ? "👤 Profile riêng đang mở để thao tác thủ công. Đóng cửa sổ khi hoàn tất."
+                : $"⚠️ Profile không tải được trang: {e.WebErrorStatus}";
             return;
         }
 
@@ -6018,6 +8769,20 @@ public partial class MainWindow : Window
         {
             _viewModel.StatusText = "Tải trang thành công!";
             string currenUrl = MainWebView.Source.ToString();
+            if (Uri.TryCreate(currenUrl, UriKind.Absolute, out Uri? currentNavigationUri) &&
+                IsHostOrSubdomain(currentNavigationUri.Host, "coursera.org") &&
+                (currentNavigationUri.AbsolutePath.Contains("/payments", StringComparison.OrdinalIgnoreCase) ||
+                 currentNavigationUri.AbsolutePath.Contains("/checkout", StringComparison.OrdinalIgnoreCase) ||
+                 currentNavigationUri.AbsolutePath.Contains("/subscriptions", StringComparison.OrdinalIgnoreCase) ||
+                 currentNavigationUri.AbsolutePath.Contains("/coursera-plus", StringComparison.OrdinalIgnoreCase) ||
+                 currentNavigationUri.AbsolutePath.Contains("/courseraplus", StringComparison.OrdinalIgnoreCase)))
+            {
+                await PauseCourseJobAsync(
+                    "⏸️ Coursera đã chuyển sang trang Plus/Trial/thanh toán; Worker đã tạm dừng.",
+                    "Tài khoản cần Coursera Plus hoặc quyền truy cập phù hợp. Hãy hoàn tất trong profile rồi bấm Tiếp tục.",
+                    "COURSERA_PLUS_REQUIRED");
+                return;
+            }
             
             // Ưu tiên các trang bài học cụ thể trước
             if (currenUrl.Contains("/home/"))
@@ -6049,11 +8814,12 @@ public partial class MainWindow : Window
             {
                 await HandleUngradedAppAsync();
             }
-            else if (currenUrl.Contains("/assignment-submission/") || currenUrl.Contains("/exam/") || currenUrl.Contains("/quiz/"))
+            else if (!currenUrl.Contains("/peer/", StringComparison.OrdinalIgnoreCase) &&
+                     (currenUrl.Contains("/assignment-submission/") || currenUrl.Contains("/exam/") || currenUrl.Contains("/quiz/")))
             {
                 await HandleQuizAsync();
             }
-            else if (currenUrl.Contains("/discussionPrompt/"))
+            else if (currenUrl.Contains("/discussionPrompt/", StringComparison.OrdinalIgnoreCase))
             {
                 await HandleDiscussionAsync();
             }
@@ -6062,16 +8828,9 @@ public partial class MainWindow : Window
                 await HandleReadingLessonAsync();
             }
 
-            else if (currenUrl.Contains("/peer/"))
+            else if (currenUrl.Contains("/peer/", StringComparison.OrdinalIgnoreCase))
             {
-                if (currenUrl.Contains("give-feedback") || currenUrl.Contains("review"))
-                {
-                    await HandlePeerReviewAsync();
-                }
-                else
-                {
-                    await HandlePeerAssignmentAsync();
-                }
+                await HandlePeerAssignmentAsync();
             }
             else if (currenUrl.Contains("/coach/") || currenUrl.Contains("/dialogue/"))
             {
@@ -6089,7 +8848,10 @@ public partial class MainWindow : Window
         }
         else
         {
-            _viewModel.StatusText = $"❌ Lỗi tải trang: {e.WebErrorStatus}";
+            await PauseCourseJobAsync(
+                $"⏸️ Không tải được trang khóa học ({e.WebErrorStatus}); Worker đã tạm dừng.",
+                "Hãy mở profile, kiểm tra kết nối/quyền truy cập rồi bấm Tiếp tục.",
+                "COURSE_NAVIGATION_FAILED");
         }
     }
 

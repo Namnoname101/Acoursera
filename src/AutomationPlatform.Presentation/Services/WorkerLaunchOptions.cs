@@ -7,11 +7,15 @@ public sealed class WorkerLaunchOptions
     public bool Enabled { get; private init; }
     public bool IsCourseJob => Enabled && !string.IsNullOrWhiteSpace(JobId);
     public bool IsDirectLogin => Enabled && !string.IsNullOrWhiteSpace(DirectLoginAttemptId);
+    public bool IsInteractiveProfile =>
+        IsCourseJob && string.Equals(JobModeHint, "browse", StringComparison.OrdinalIgnoreCase);
+    public bool IsCourseAutomation => IsCourseJob && !IsInteractiveProfile;
     public Uri? ServerUrl { get; private init; }
     public string WorkerId { get; private init; } = string.Empty;
     public string JobId { get; private init; } = string.Empty;
     public string DeviceId { get; private init; } = string.Empty;
     public string DirectLoginAttemptId { get; private init; } = string.Empty;
+    public string JobModeHint { get; private init; } = string.Empty;
     public string ProfilePath { get; private init; } = string.Empty;
     internal string WorkerKey { get; private init; } = string.Empty;
 
@@ -68,6 +72,13 @@ public sealed class WorkerLaunchOptions
         }
 
         bool isDirectLogin = !string.IsNullOrWhiteSpace(directLoginAttemptId);
+        string jobModeHint = values.TryGetValue("--job-mode", out string? configuredJobMode)
+            ? configuredJobMode.Trim().ToLowerInvariant()
+            : (isDirectLogin ? string.Empty : "course");
+        if (!isDirectLogin && jobModeHint is not ("course" or "browse"))
+        {
+            throw new InvalidOperationException("Worker job mode must be course or browse.");
+        }
         if (isDirectLogin && serverUrl.Scheme != Uri.UriSchemeHttps && !serverUrl.IsLoopback)
         {
             throw new InvalidOperationException(
@@ -97,6 +108,7 @@ public sealed class WorkerLaunchOptions
             JobId = jobId,
             DeviceId = deviceId,
             DirectLoginAttemptId = directLoginAttemptId,
+            JobModeHint = jobModeHint,
             ProfilePath = Path.GetFullPath(profilePath),
             WorkerKey = workerKey,
         };
@@ -111,6 +123,6 @@ public sealed class WorkerLaunchOptions
         if (!Enabled) return "Interactive mode";
         return IsDirectLogin
             ? $"Worker {WorkerId} / direct login {DirectLoginAttemptId}"
-            : $"Worker {WorkerId} / job {JobId} / device {DeviceId}";
+            : $"Worker {WorkerId} / {JobModeHint} job {JobId} / device {DeviceId}";
     }
 }

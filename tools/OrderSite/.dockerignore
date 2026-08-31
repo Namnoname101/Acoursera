@@ -1,0 +1,13 @@
+node_modules
+npm-debug.log*
+.git
+.openai
+app
+components
+hooks
+lib
+next.config.ts
+tsconfig.json
+vite.config.ts
+components.json
+test

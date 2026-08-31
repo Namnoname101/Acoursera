@@ -41,6 +41,26 @@ public sealed class CentralWorkerClient : IDisposable
         return CurrentJob;
     }
 
+    public async Task<WorkerJob?> ClaimNextBatchJobAsync(
+        CancellationToken cancellationToken = default)
+    {
+        WorkerJob currentJob = RequireCurrentJob();
+        if (string.IsNullOrWhiteSpace(currentJob.BatchId)) return null;
+        ApiEnvelope<WorkerJob> response = await SendAsync<WorkerJob>(
+            HttpMethod.Post,
+            $"api/worker/jobs/batches/{Uri.EscapeDataString(currentJob.BatchId)}/next",
+            new { deviceId = currentJob.DeviceId },
+            cancellationToken);
+        if (response.Data == null) return null;
+        if (!string.Equals(response.Data.DeviceId, currentJob.DeviceId, StringComparison.Ordinal) ||
+            !string.Equals(response.Data.BatchId, currentJob.BatchId, StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException("Batch continuation returned a job outside the active account batch.");
+        }
+        CurrentJob = response.Data;
+        return CurrentJob;
+    }
+
     public async Task<DirectLoginAttempt> ClaimDirectLoginAttemptAsync(
         CancellationToken cancellationToken = default)
     {
@@ -200,7 +220,7 @@ public sealed class CentralWorkerClient : IDisposable
         return response.Data ?? throw new InvalidOperationException("Session lease returned no data.");
     }
 
-    public Task HeartbeatAsync(
+    public async Task<WorkerJob> HeartbeatAsync(
         string status,
         string currentActivity,
         int? progress = null,
@@ -209,7 +229,7 @@ public sealed class CentralWorkerClient : IDisposable
         CancellationToken cancellationToken = default)
     {
         WorkerJob job = RequireCurrentJob();
-        return SendWithoutResultAsync(
+        ApiEnvelope<WorkerJob> response = await SendAsync<WorkerJob>(
             HttpMethod.Post,
             $"api/worker/jobs/{Uri.EscapeDataString(job.Id)}/heartbeat",
             new
@@ -222,6 +242,46 @@ public sealed class CentralWorkerClient : IDisposable
                 agentVersion = typeof(CentralWorkerClient).Assembly.GetName().Version?.ToString() ?? "3.3.2",
             },
             cancellationToken);
+        CurrentJob = response.Data
+            ?? throw new InvalidOperationException("Worker heartbeat returned no job state.");
+        return CurrentJob;
+    }
+
+    public async Task<WorkerJob> PauseAsync(
+        string currentActivity,
+        string manualActionReason,
+        string errorCode,
+        int? progress = null,
+        int? currentModule = null,
+        int? totalModules = null,
+        CancellationToken cancellationToken = default)
+    {
+        WorkerJob job = RequireCurrentJob();
+        string safeActivity = string.IsNullOrWhiteSpace(currentActivity)
+            ? "Worker paused for manual action."
+            : currentActivity[..Math.Min(currentActivity.Length, 500)];
+        string safeReason = string.IsNullOrWhiteSpace(manualActionReason)
+            ? "Cần thao tác thủ công trên profile Coursera."
+            : manualActionReason[..Math.Min(manualActionReason.Length, 500)];
+        ApiEnvelope<WorkerJob> response = await SendAsync<WorkerJob>(
+            HttpMethod.Post,
+            $"api/worker/jobs/{Uri.EscapeDataString(job.Id)}/heartbeat",
+            new
+            {
+                status = "waiting_user",
+                currentActivity = safeActivity,
+                manualActionReason = safeReason,
+                errorCode,
+                errorMessageSafe = safeReason,
+                progress,
+                currentModule,
+                totalModules,
+                agentVersion = typeof(CentralWorkerClient).Assembly.GetName().Version?.ToString() ?? "3.3.2",
+            },
+            cancellationToken);
+        CurrentJob = response.Data
+            ?? throw new InvalidOperationException("Worker pause acknowledgement returned no job state.");
+        return CurrentJob;
     }
 
     public Task ReportIdentityAsync(
@@ -247,8 +307,25 @@ public sealed class CentralWorkerClient : IDisposable
             cancellationToken);
     }
 
-    public Task FailAsync(string message, CancellationToken cancellationToken = default) =>
-        HeartbeatAsync("failed", message, cancellationToken: cancellationToken);
+    public Task FailAsync(string message, CancellationToken cancellationToken = default)
+    {
+        WorkerJob job = RequireCurrentJob();
+        string safeMessage = string.IsNullOrWhiteSpace(message)
+            ? "Worker stopped because of an unrecoverable error."
+            : message[..Math.Min(message.Length, 500)];
+        return SendWithoutResultAsync(
+            HttpMethod.Post,
+            $"api/worker/jobs/{Uri.EscapeDataString(job.Id)}/heartbeat",
+            new
+            {
+                status = "failed",
+                currentActivity = safeMessage,
+                errorCode = "WORKER_AI_OR_AUTOMATION_FAILED",
+                errorMessageSafe = safeMessage,
+                agentVersion = typeof(CentralWorkerClient).Assembly.GetName().Version?.ToString() ?? "3.3.2",
+            },
+            cancellationToken);
+    }
 
     private async Task SendWithoutResultAsync(
         HttpMethod method,
@@ -444,11 +521,17 @@ public sealed class WorkerJob
     [JsonPropertyName("deviceId")]
     public string DeviceId { get; set; } = string.Empty;
 
+    [JsonPropertyName("courseraUserName")]
+    public string? CourseraUserName { get; set; }
+
     [JsonPropertyName("mode")]
     public string Mode { get; set; } = "course";
 
     [JsonPropertyName("targetUrl")]
     public string TargetUrl { get; set; } = "https://www.coursera.org/";
+
+    [JsonPropertyName("batchId")]
+    public string? BatchId { get; set; }
 
     [JsonPropertyName("skipGradedAppItems")]
     public bool SkipGradedAppItems { get; set; } = true;
@@ -464,6 +547,15 @@ public sealed class WorkerJob
 
     [JsonPropertyName("totalModules")]
     public int? TotalModules { get; set; }
+
+    [JsonPropertyName("status")]
+    public string Status { get; set; } = string.Empty;
+
+    [JsonPropertyName("pauseRequested")]
+    public bool PauseRequested { get; set; }
+
+    [JsonPropertyName("pauseRequestedReason")]
+    public string? PauseRequestedReason { get; set; }
 }
 
 public sealed class SessionLease

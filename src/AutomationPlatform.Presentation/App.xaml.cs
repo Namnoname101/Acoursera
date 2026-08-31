@@ -41,7 +41,7 @@ public partial class App : System.Windows.Application
                 // Đăng ký ViewModels
                 services.AddTransient<MainViewModel>();
 
-                // AgentRouter chạy qua Codex harness; lỗi/quota sẽ chuyển sang các HTTP provider.
+                // Chỉ dùng AgentRouter qua Codex harness; không fallback sang provider khác.
                 services.AddSingleton<AiCompletionService>();
 
                 // Worker mode chỉ thêm lớp điều phối; logic automation trong MainWindow được giữ nguyên.

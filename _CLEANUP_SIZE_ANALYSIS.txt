@@ -1,0 +1,322 @@
+﻿=== PROJECT CLEANUP SIZE ANALYSIS ===
+Root: E:\Code\cousera\Acoursera
+
+=== TOP LEVEL ===
+
+SizeGB  SizeMB Files Path                                   
+------  ------ ----- ----                                   
+ 7.477 7656.91 24802 E:\Code\cousera\Acoursera\artifacts    
+ 1.452 1486.37  6057 E:\Code\cousera\Acoursera\src          
+  0.69  706.78  3442 E:\Code\cousera\Acoursera\.tmp         
+ 0.682  698.41  2143 E:\Code\cousera\Acoursera\tools        
+ 0.008    8.55    71 E:\Code\cousera\Acoursera\.vs          
+ 0.006    5.86   955 E:\Code\cousera\Acoursera\.git         
+     0    0.02    28 E:\Code\cousera\Acoursera\.codex-dotnet
+
+
+
+
+=== ARTIFACTS SUBFOLDERS ===
+
+SizeGB  SizeMB Files Path                                                                   
+------  ------ ----- ----                                                                   
+ 1.849 1893.79   459 E:\Code\cousera\Acoursera\artifacts\acose-distribution-build           
+ 0.408  418.14  1710 E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830u       
+ 0.338   346.3  1435 E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830r       
+  0.31  317.41  1450 E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830q       
+  0.31  317.08  1396 E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830m       
+ 0.296  303.17  1419 E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830x       
+  0.25  256.49  1242 E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830l       
+ 0.232  237.75  1218 E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830j       
+ 0.228  233.61  1223 E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830v       
+ 0.217  222.49   786 E:\Code\cousera\Acoursera\artifacts\worker-profile-pause-20260831a     
+ 0.217  222.46   786 E:\Code\cousera\Acoursera\artifacts\worker-profile-open-20260831b      
+ 0.205  210.36  1198 E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830p       
+ 0.183  187.85  1130 E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830f       
+ 0.162  165.63  1020 E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830i       
+ 0.138   141.4   412 E:\Code\cousera\Acoursera\artifacts\bin-helper-clean                   
+ 0.132  134.97     5 E:\Code\cousera\Acoursera\artifacts\CourseraLoginHelper-win-x64        
+ 0.108  110.27   412 E:\Code\cousera\Acoursera\artifacts\worker-profile-open-20260831a      
+ 0.108  110.27   412 E:\Code\cousera\Acoursera\artifacts\worker-reading-completion-20260831a
+ 0.108  110.24   412 E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830w       
+ 0.108  110.22   412 E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830s       
+ 0.108  110.22   412 E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830t       
+ 0.108   110.2   415 E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830k       
+ 0.108  110.18   412 E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830n       
+ 0.108  110.18   415 E:\Code\cousera\Acoursera\artifacts\completion-build                   
+ 0.108  110.18   415 E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830g       
+ 0.108  110.18   412 E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830o       
+ 0.108  110.18   415 E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830        
+ 0.108  110.18   415 E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830h       
+ 0.108  110.18   415 E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830b       
+ 0.108  110.18   415 E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830c       
+ 0.108  110.18   415 E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830d       
+ 0.108  110.18   415 E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830e       
+ 0.108  110.17   415 E:\Code\cousera\Acoursera\artifacts\progress-build                     
+  0.08   81.54   393 E:\Code\cousera\Acoursera\artifacts\backend-worker-guided-project-fix  
+  0.08   81.54   393 E:\Code\cousera\Acoursera\artifacts\backend-worker-3.2.0               
+  0.01   10.19    37 E:\Code\cousera\Acoursera\artifacts\obj-helper-clean                   
+ 0.001    0.73     4 E:\Code\cousera\Acoursera\artifacts\license-smoke                      
+     0    0.38    24 E:\Code\cousera\Acoursera\artifacts\skip-options                       
+     0    0.14    14 E:\Code\cousera\Acoursera\artifacts\obj-helper                         
+     0    0.07     7 E:\Code\cousera\Acoursera\artifacts\obj-helper-main                    
+     0    0.06     6 E:\Code\cousera\Acoursera\artifacts\cli-source-recovery                
+     0       0     0 E:\Code\cousera\Acoursera\artifacts\bin-helper                         
+     0       0     0 E:\Code\cousera\Acoursera\artifacts\bin-helper-main                    
+
+
+
+
+=== SRC PROJECTS ===
+
+SizeGB  SizeMB Files Path                                                           
+------  ------ ----- ----                                                           
+ 1.125 1151.94  4183 E:\Code\cousera\Acoursera\src\AutomationPlatform.Presentation  
+ 0.172  175.63  1007 E:\Code\cousera\Acoursera\src\AutomationPlatform.Tests         
+ 0.151  154.97   739 E:\Code\cousera\Acoursera\src\AutomationPlatform.Infrastructure
+ 0.003    3.27    16 E:\Code\cousera\Acoursera\src\.vs                              
+     0    0.32    58 E:\Code\cousera\Acoursera\src\AutomationPlatform.Application   
+     0    0.22    52 E:\Code\cousera\Acoursera\src\AutomationPlatform.Domain        
+
+
+
+
+=== TOOLS ===
+
+SizeGB SizeMB Files Path                                               
+------ ------ ----- ----                                               
+ 0.282 289.22   514 E:\Code\cousera\Acoursera\tools\CourseraLoginHelper
+  0.16 163.77   434 E:\Code\cousera\Acoursera\tools\Acose.Cli          
+ 0.148 151.17   447 E:\Code\cousera\Acoursera\tools\Acose.Login        
+ 0.087   89.6     7 E:\Code\cousera\Acoursera\tools\AcoseDistribution  
+ 0.004   3.63   655 E:\Code\cousera\Acoursera\tools\CookieServer       
+ 0.001   1.02    86 E:\Code\cousera\Acoursera\tools\OrderSite          
+
+
+
+
+=== BIN / OBJ / NODE_MODULES TOTAL ===
+
+SizeGB  SizeMB Files Path                                                                                                                     
+------  ------ ----- ----                                                                                                                     
+ 1.119 1145.79  4063 E:\Code\cousera\Acoursera\src\AutomationPlatform.Presentation\bin                                                        
+ 0.272  278.41   431 E:\Code\cousera\Acoursera\tools\CourseraLoginHelper\bin                                                                  
+  0.17  174.38   962 E:\Code\cousera\Acoursera\src\AutomationPlatform.Tests\bin                                                               
+  0.15  153.67   690 E:\Code\cousera\Acoursera\src\AutomationPlatform.Infrastructure\bin                                                      
+  0.15  153.42   386 E:\Code\cousera\Acoursera\tools\Acose.Cli\bin                                                                            
+ 0.138  141.15   408 E:\Code\cousera\Acoursera\tools\Acose.Login\bin                                                                          
+ 0.136  139.25   400 E:\Code\cousera\Acoursera\artifacts\acose-distribution-build\login-stub\bin                                              
+  0.01   10.68    70 E:\Code\cousera\Acoursera\tools\CourseraLoginHelper\obj                                                                  
+  0.01   10.32    46 E:\Code\cousera\Acoursera\tools\Acose.Cli\obj                                                                            
+  0.01   10.01    34 E:\Code\cousera\Acoursera\tools\Acose.Login\obj                                                                          
+  0.01    9.83    26 E:\Code\cousera\Acoursera\artifacts\acose-distribution-build\login-stub\obj                                              
+ 0.008    8.55    71 E:\Code\cousera\Acoursera\.vs                                                                                            
+ 0.005    5.34   100 E:\Code\cousera\Acoursera\src\AutomationPlatform.Presentation\obj                                                        
+ 0.003    3.27    16 E:\Code\cousera\Acoursera\src\.vs                                                                                        
+ 0.002    2.23   626 E:\Code\cousera\Acoursera\tools\CookieServer\node_modules                                                                
+ 0.001    1.16    38 E:\Code\cousera\Acoursera\src\AutomationPlatform.Infrastructure\obj                                                      
+ 0.001    0.88    37 E:\Code\cousera\Acoursera\src\AutomationPlatform.Tests\obj                                                               
+     0    0.38    24 E:\Code\cousera\Acoursera\artifacts\skip-options\obj                                                                     
+     0    0.37     8 E:\Code\cousera\Acoursera\src\AutomationPlatform.Tests\obj-codex                                                         
+     0    0.28    18 E:\Code\cousera\Acoursera\artifacts\backend-worker-guided-project-fix\.playwright\package\bin                            
+     0    0.28    18 E:\Code\cousera\Acoursera\artifacts\completion-build\.playwright\package\bin                                             
+     0    0.28    18 E:\Code\cousera\Acoursera\src\AutomationPlatform.Tests\bin\Release\net10.0-windows\.playwright\package\bin               
+     0    0.28    18 E:\Code\cousera\Acoursera\artifacts\progress-build\.playwright\package\bin                                               
+     0    0.28    18 E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830d\.playwright\package\bin                                 
+     0    0.28    18 E:\Code\cousera\Acoursera\artifacts\worker-reading-completion-20260831a\.playwright\package\bin                          
+     0    0.28    18 E:\Code\cousera\Acoursera\.tmp\worker-release-check\.playwright\package\bin                                              
+     0    0.28    18 E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830e\.playwright\package\bin                                 
+     0    0.28    18 E:\Code\cousera\Acoursera\artifacts\backend-worker-3.2.0\.playwright\package\bin                                         
+     0    0.28    18 E:\Code\cousera\Acoursera\src\AutomationPlatform.Presentation\bin\Release\net10.0-windows\.playwright\package\bin        
+     0    0.28    18 E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830b\.playwright\package\bin                                 
+     0    0.28    18 E:\Code\cousera\Acoursera\src\AutomationPlatform.Presentation\bin\Debug\net10.0-windows\.playwright\package\bin          
+     0    0.28    18 E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830\.playwright\package\bin                                  
+     0    0.28    18 E:\Code\cousera\Acoursera\src\AutomationPlatform.Infrastructure\bin\Release\net10.0-windows\.playwright\package\bin      
+     0    0.28    18 E:\Code\cousera\Acoursera\src\AutomationPlatform.Tests\bin\Debug\net10.0-windows\.playwright\package\bin                 
+     0    0.28    18 E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830c\.playwright\package\bin                                 
+     0    0.28    18 E:\Code\cousera\Acoursera\src\AutomationPlatform.Infrastructure\bin\Debug\net10.0-windows\.playwright\package\bin        
+     0    0.28    18 E:\Code\cousera\Acoursera\src\AutomationPlatform.Presentation\bin\Release\net10.0-windows\win-x64\.playwright\package\bin
+     0    0.28    18 E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830m\.playwright\package\bin                                 
+     0    0.28    18 E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830l\.playwright\package\bin                                 
+     0    0.28    18 E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830n\.playwright\package\bin                                 
+     0    0.28    18 E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830p\.playwright\package\bin                                 
+     0    0.28    18 E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830o\.playwright\package\bin                                 
+     0    0.28    18 E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830k\.playwright\package\bin                                 
+     0    0.28    18 E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830g\.playwright\package\bin                                 
+     0    0.28    18 E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830f\.playwright\package\bin                                 
+     0    0.28    18 E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830h\.playwright\package\bin                                 
+     0    0.28    18 E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830j\.playwright\package\bin                                 
+     0    0.28    18 E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830i\.playwright\package\bin                                 
+     0    0.28    18 E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830q\.playwright\package\bin                                 
+     0    0.28    18 E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830x\.playwright\package\bin                                 
+     0    0.28    18 E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830w\.playwright\package\bin                                 
+     0    0.28    18 E:\Code\cousera\Acoursera\artifacts\worker-profile-open-20260831a\.playwright\package\bin                                
+     0    0.28    18 E:\Code\cousera\Acoursera\artifacts\worker-profile-pause-20260831a\.playwright\package\bin                               
+     0    0.28    18 E:\Code\cousera\Acoursera\artifacts\worker-profile-open-20260831b\.playwright\package\bin                                
+     0    0.28    18 E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830t\.playwright\package\bin                                 
+     0    0.28    18 E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830s\.playwright\package\bin                                 
+     0    0.28    18 E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830r\.playwright\package\bin                                 
+     0    0.28    18 E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830u\.playwright\package\bin                                 
+     0    0.28    18 E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830v\.playwright\package\bin                                 
+     0    0.25     8 E:\Code\cousera\Acoursera\src\AutomationPlatform.Presentation\obj-codex                                                  
+     0    0.16    38 E:\Code\cousera\Acoursera\src\AutomationPlatform.Application\obj                                                         
+     0    0.13    34 E:\Code\cousera\Acoursera\src\AutomationPlatform.Domain\obj                                                              
+     0    0.13     8 E:\Code\cousera\Acoursera\src\AutomationPlatform.Infrastructure\obj-codex                                                
+     0    0.11     8 E:\Code\cousera\Acoursera\tools\CourseraLoginHelper\obj-codex                                                            
+     0    0.09    10 E:\Code\cousera\Acoursera\src\AutomationPlatform.Application\bin                                                         
+     0    0.07     8 E:\Code\cousera\Acoursera\src\AutomationPlatform.Application\obj-codex                                                   
+     0    0.05     9 E:\Code\cousera\Acoursera\src\AutomationPlatform.Domain\obj-codex                                                        
+     0    0.04     6 E:\Code\cousera\Acoursera\src\AutomationPlatform.Domain\bin                                                              
+     0    0.01     4 E:\Code\cousera\Acoursera\tools\CookieServer\node_modules\send\node_modules                                              
+     0       0     1 E:\Code\cousera\Acoursera\tools\OrderSite\node_modules                                                                   
+     0       0     0 E:\Code\cousera\Acoursera\tools\CourseraLoginHelper\bin-codex                                                            
+     0       0     0 E:\Code\cousera\Acoursera\src\AutomationPlatform.Application\bin-codex                                                   
+     0       0     0 E:\Code\cousera\Acoursera\src\AutomationPlatform.Presentation\bin-codex                                                  
+     0       0     0 E:\Code\cousera\Acoursera\src\AutomationPlatform.Tests\bin-codex                                                         
+     0       0     0 E:\Code\cousera\Acoursera\src\AutomationPlatform.Infrastructure\bin-codex                                                
+     0       0     0 E:\Code\cousera\Acoursera\src\AutomationPlatform.Domain\bin-codex                                                        
+     0       0     0 E:\Code\cousera\Acoursera\artifacts\skip-options\bin                                                                     
+
+
+
+
+=== POSSIBLE RELEASE / RECOVERY / BACKUP ===
+
+FullName                                                                                                                                                               
+--------                                                                                                                                                               
+E:\Code\cousera\Acoursera\.git\codex-backups                                                                                                                           
+E:\Code\cousera\Acoursera\.tmp\direct-worker-smoke                                                                                                                     
+E:\Code\cousera\Acoursera\.tmp\worker-release-check                                                                                                                    
+E:\Code\cousera\Acoursera\.tmp\direct-worker-smoke\779beecc-e1a8-4133-9616-4f6d1d2bf3ac\EBWebView\Default\Service Worker                                               
+E:\Code\cousera\Acoursera\.tmp\worker-release-check\.playwright\package                                                                                                
+E:\Code\cousera\Acoursera\artifacts\backend-worker-3.2.0                                                                                                               
+E:\Code\cousera\Acoursera\artifacts\backend-worker-guided-project-fix                                                                                                  
+E:\Code\cousera\Acoursera\artifacts\cli-source-recovery                                                                                                                
+E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830                                                                                                        
+E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830b                                                                                                       
+E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830c                                                                                                       
+E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830d                                                                                                       
+E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830e                                                                                                       
+E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830f                                                                                                       
+E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830g                                                                                                       
+E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830h                                                                                                       
+E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830i                                                                                                       
+E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830j                                                                                                       
+E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830k                                                                                                       
+E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830l                                                                                                       
+E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830m                                                                                                       
+E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830n                                                                                                       
+E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830o                                                                                                       
+E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830p                                                                                                       
+E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830q                                                                                                       
+E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830r                                                                                                       
+E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830s                                                                                                       
+E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830t                                                                                                       
+E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830u                                                                                                       
+E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830v                                                                                                       
+E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830w                                                                                                       
+E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830x                                                                                                       
+E:\Code\cousera\Acoursera\artifacts\worker-profile-open-20260831a                                                                                                      
+E:\Code\cousera\Acoursera\artifacts\worker-profile-open-20260831b                                                                                                      
+E:\Code\cousera\Acoursera\artifacts\worker-profile-pause-20260831a                                                                                                     
+E:\Code\cousera\Acoursera\artifacts\worker-reading-completion-20260831a                                                                                                
+E:\Code\cousera\Acoursera\artifacts\acose-distribution-build\package                                                                                                   
+E:\Code\cousera\Acoursera\artifacts\acose-distribution-build\package-3.4.0                                                                                             
+E:\Code\cousera\Acoursera\artifacts\acose-distribution-build\package-3.4.1                                                                                             
+E:\Code\cousera\Acoursera\artifacts\acose-distribution-build\release-backups                                                                                           
+E:\Code\cousera\Acoursera\artifacts\acose-distribution-build\verify-3.4.1                                                                                              
+E:\Code\cousera\Acoursera\artifacts\acose-distribution-build\login-stub\bin\Release                                                                                    
+E:\Code\cousera\Acoursera\artifacts\acose-distribution-build\login-stub\obj\Release                                                                                    
+E:\Code\cousera\Acoursera\artifacts\backend-worker-3.2.0\.playwright\package                                                                                           
+E:\Code\cousera\Acoursera\artifacts\backend-worker-guided-project-fix\.playwright\package                                                                              
+E:\Code\cousera\Acoursera\artifacts\bin-helper\Release                                                                                                                 
+E:\Code\cousera\Acoursera\artifacts\bin-helper\$(MSBuildProjectName)\Release                                                                                           
+E:\Code\cousera\Acoursera\artifacts\bin-helper-clean\Release                                                                                                           
+E:\Code\cousera\Acoursera\artifacts\bin-helper-main\Release                                                                                                            
+E:\Code\cousera\Acoursera\artifacts\completion-build\.playwright\package                                                                                               
+E:\Code\cousera\Acoursera\artifacts\obj-helper\Release                                                                                                                 
+E:\Code\cousera\Acoursera\artifacts\obj-helper\$(MSBuildProjectName)\Release                                                                                           
+E:\Code\cousera\Acoursera\artifacts\obj-helper-clean\Release                                                                                                           
+E:\Code\cousera\Acoursera\artifacts\obj-helper-main\Release                                                                                                            
+E:\Code\cousera\Acoursera\artifacts\progress-build\.playwright\package                                                                                                 
+E:\Code\cousera\Acoursera\artifacts\skip-options\bin\Release                                                                                                           
+E:\Code\cousera\Acoursera\artifacts\skip-options\obj\Release                                                                                                           
+E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830\.playwright\package                                                                                    
+E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830b\.playwright\package                                                                                   
+E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830c\.playwright\package                                                                                   
+E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830d\.playwright\package                                                                                   
+E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830e\.playwright\package                                                                                   
+E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830f\.playwright\package                                                                                   
+E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830f\automationplatform.presentation.exe.WebView2\EBWebView\Default\Service Worker                         
+E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830g\.playwright\package                                                                                   
+E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830h\.playwright\package                                                                                   
+E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830i\.playwright\package                                                                                   
+E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830i\automationplatform.presentation.exe.WebView2\EBWebView\Default\Service Worker                         
+E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830j\.playwright\package                                                                                   
+E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830j\automationplatform.presentation.exe.WebView2\EBWebView\Default\Service Worker                         
+E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830k\.playwright\package                                                                                   
+E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830l\.playwright\package                                                                                   
+E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830m\.playwright\package                                                                                   
+E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830m\automationplatform.presentation.exe.WebView2\EBWebView\Default\Service Worker                         
+E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830n\.playwright\package                                                                                   
+E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830o\.playwright\package                                                                                   
+E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830p\.playwright\package                                                                                   
+E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830p\AutomationPlatform.Presentation.exe.WebView2\EBWebView\Default\Service Worker                         
+E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830q\.playwright\package                                                                                   
+E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830q\AutomationPlatform.Presentation.exe.WebView2\EBWebView\Default\Service Worker                         
+E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830r\.playwright\package                                                                                   
+E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830r\AutomationPlatform.Presentation.exe.WebView2\EBWebView\Default\Service Worker                         
+E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830s\.playwright\package                                                                                   
+E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830t\.playwright\package                                                                                   
+E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830u\.playwright\package                                                                                   
+E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830u\AutomationPlatform.Presentation.exe.WebView2\EBWebView\Default\Service Worker                         
+E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830v\.playwright\package                                                                                   
+E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830w\.playwright\package                                                                                   
+E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830x\.playwright\package                                                                                   
+E:\Code\cousera\Acoursera\artifacts\worker-agentrouter-20260830x\AutomationPlatform.Presentation.exe.WebView2\EBWebView\Default\Service Worker                         
+E:\Code\cousera\Acoursera\artifacts\worker-profile-open-20260831a\.playwright\package                                                                                  
+E:\Code\cousera\Acoursera\artifacts\worker-profile-open-20260831b\.playwright\package                                                                                  
+E:\Code\cousera\Acoursera\artifacts\worker-profile-pause-20260831a\.playwright\package                                                                                 
+E:\Code\cousera\Acoursera\artifacts\worker-reading-completion-20260831a\.playwright\package                                                                            
+E:\Code\cousera\Acoursera\src\AutomationPlatform.Application\bin\Release                                                                                               
+E:\Code\cousera\Acoursera\src\AutomationPlatform.Application\bin-codex\Release                                                                                         
+E:\Code\cousera\Acoursera\src\AutomationPlatform.Application\obj\Release                                                                                               
+E:\Code\cousera\Acoursera\src\AutomationPlatform.Application\obj-codex\Release                                                                                         
+E:\Code\cousera\Acoursera\src\AutomationPlatform.Domain\bin\Release                                                                                                    
+E:\Code\cousera\Acoursera\src\AutomationPlatform.Domain\bin-codex\Release                                                                                              
+E:\Code\cousera\Acoursera\src\AutomationPlatform.Domain\obj\Release                                                                                                    
+E:\Code\cousera\Acoursera\src\AutomationPlatform.Domain\obj-codex\Release                                                                                              
+E:\Code\cousera\Acoursera\src\AutomationPlatform.Infrastructure\bin\Release                                                                                            
+E:\Code\cousera\Acoursera\src\AutomationPlatform.Infrastructure\bin\Debug\net10.0-windows\.playwright\package                                                          
+E:\Code\cousera\Acoursera\src\AutomationPlatform.Infrastructure\bin\Release\net10.0-windows\.playwright\package                                                        
+E:\Code\cousera\Acoursera\src\AutomationPlatform.Infrastructure\bin-codex\Release                                                                                      
+E:\Code\cousera\Acoursera\src\AutomationPlatform.Infrastructure\obj\Release                                                                                            
+E:\Code\cousera\Acoursera\src\AutomationPlatform.Infrastructure\obj-codex\Release                                                                                      
+E:\Code\cousera\Acoursera\src\AutomationPlatform.Presentation\bin\Release                                                                                              
+E:\Code\cousera\Acoursera\src\AutomationPlatform.Presentation\bin\Debug\net10.0-windows\.playwright\package                                                            
+E:\Code\cousera\Acoursera\src\AutomationPlatform.Presentation\bin\Release\net10.0-windows\.playwright\package                                                          
+E:\Code\cousera\Acoursera\src\AutomationPlatform.Presentation\bin\Release\net10.0-windows\AutomationPlatform.Presentation.exe.WebView2\EBWebView\Default\Service Worker
+E:\Code\cousera\Acoursera\src\AutomationPlatform.Presentation\bin\Release\net10.0-windows\win-x64\.playwright\package                                                  
+E:\Code\cousera\Acoursera\src\AutomationPlatform.Presentation\bin-codex\Release                                                                                        
+E:\Code\cousera\Acoursera\src\AutomationPlatform.Presentation\obj\Release                                                                                              
+E:\Code\cousera\Acoursera\src\AutomationPlatform.Presentation\obj-codex\Release                                                                                        
+E:\Code\cousera\Acoursera\src\AutomationPlatform.Tests\bin\Release                                                                                                     
+E:\Code\cousera\Acoursera\src\AutomationPlatform.Tests\bin\Debug\net10.0-windows\.playwright\package                                                                   
+E:\Code\cousera\Acoursera\src\AutomationPlatform.Tests\bin\Release\net10.0-windows\.playwright\package                                                                 
+E:\Code\cousera\Acoursera\src\AutomationPlatform.Tests\bin-codex\Release                                                                                               
+E:\Code\cousera\Acoursera\src\AutomationPlatform.Tests\obj\Release                                                                                                     
+E:\Code\cousera\Acoursera\src\AutomationPlatform.Tests\obj-codex\Release                                                                                               
+E:\Code\cousera\Acoursera\tools\Acose.Cli\bin\Release                                                                                                                  
+E:\Code\cousera\Acoursera\tools\Acose.Cli\obj\Release                                                                                                                  
+E:\Code\cousera\Acoursera\tools\Acose.Login\bin\Release                                                                                                                
+E:\Code\cousera\Acoursera\tools\Acose.Login\obj\Release                                                                                                                
+E:\Code\cousera\Acoursera\tools\AcoseDistribution\release                                                                                                              
+E:\Code\cousera\Acoursera\tools\CourseraLoginHelper\bin\Release                                                                                                        
+E:\Code\cousera\Acoursera\tools\CourseraLoginHelper\bin-codex\Release                                                                                                  
+E:\Code\cousera\Acoursera\tools\CourseraLoginHelper\obj\Release                                                                                                        
+E:\Code\cousera\Acoursera\tools\CourseraLoginHelper\obj-codex\Release                                                                                                  
+
+
+
+
+=== END ===
