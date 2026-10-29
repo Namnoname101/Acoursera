@@ -1,8 +1,18 @@
-<Project Sdk="Microsoft.NET.Sdk">
+﻿<Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
   </PropertyGroup>
   <ItemGroup>
+    <EmbeddedResource Include="Services\QuizOpeningProbe.js" LogicalName="Acose.QuizOpeningProbe.js" />
+    <EmbeddedResource Include="Services\QuizFeedbackProbe.js" LogicalName="Acose.QuizFeedbackProbe.js" />
+    <EmbeddedResource Include="Services\QuizFeedbackOpeningProbe.js" LogicalName="Acose.QuizFeedbackOpeningProbe.js" />
+    <EmbeddedResource Include="Services\CourseEnrollmentProbe.js" LogicalName="Acose.CourseEnrollmentProbe.js" />
+    <EmbeddedResource Include="Services\DiscussionPageProbe.js" LogicalName="Acose.DiscussionPageProbe.js" />
+    <EmbeddedResource Include="Services\PeerPdfProbe.js" LogicalName="Acose.PeerPdfProbe.js" />
+    <EmbeddedResource Include="Services\PeerPdfRevisionProbe.js" LogicalName="Acose.PeerPdfRevisionProbe.js" />
+    <EmbeddedResource Include="Services\PeerAssignmentContextProbe.js" LogicalName="Acose.PeerAssignmentContextProbe.js" />
+    <EmbeddedResource Include="Services\PeerReviewProbe.js" LogicalName="Acose.PeerReviewProbe.js" />
+    <EmbeddedResource Include="Services\OptionalCourseActivityProbe.js" LogicalName="Acose.OptionalCourseActivityProbe.js" />
     <PackageReference Include="Microsoft.Extensions.Hosting" />
     <PackageReference Include="Microsoft.Extensions.DependencyInjection" />
     <PackageReference Include="Microsoft.Web.WebView2" />

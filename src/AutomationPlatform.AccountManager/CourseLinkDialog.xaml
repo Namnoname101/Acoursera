@@ -1,0 +1,52 @@
+<Window x:Class="AutomationPlatform.AccountManager.CourseLinkDialog"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Sửa link khóa học"
+        Width="680"
+        Height="220"
+        MinWidth="520"
+        MinHeight="200"
+        WindowStartupLocation="CenterOwner"
+        ResizeMode="CanResizeWithGrip"
+        ShowInTaskbar="False"
+        Background="{StaticResource PageBrush}"
+        FontFamily="Segoe UI">
+    <Grid Margin="22">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+            <RowDefinition Height="Auto" />
+        </Grid.RowDefinitions>
+
+        <TextBlock FontSize="18"
+                   FontWeight="SemiBold"
+                   Foreground="{StaticResource TextBrush}"
+                   Text="Sửa link khóa học" />
+        <TextBlock Grid.Row="1"
+                   Margin="0,6,0,12"
+                   FontSize="12"
+                   Foreground="{StaticResource MutedBrush}"
+                   Text="Nhập link HTTPS thuộc coursera.org." />
+        <TextBox x:Name="CourseUrlTextBox"
+                 Grid.Row="2"
+                 VerticalAlignment="Top"
+                 KeyDown="CourseUrlTextBox_KeyDown" />
+
+        <StackPanel Grid.Row="3"
+                    Margin="0,16,0,0"
+                    HorizontalAlignment="Right"
+                    Orientation="Horizontal">
+            <Button MinWidth="90"
+                    Click="CancelButton_Click"
+                    Content="Hủy"
+                    IsCancel="True"
+                    Style="{StaticResource SecondaryButton}" />
+            <Button MinWidth="100"
+                    Margin="8,0,0,0"
+                    Click="SaveButton_Click"
+                    Content="Lưu link"
+                    IsDefault="True" />
+        </StackPanel>
+    </Grid>
+</Window>

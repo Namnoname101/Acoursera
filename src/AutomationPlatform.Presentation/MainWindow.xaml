@@ -17,6 +17,8 @@
 
             <Button Content="Start (Đi tới)" Click="OnTestClick" Padding="15,10" Margin="0,0,10,0"/>
             <Button Content="Đăng nhập" Click="OnLoginClick" Padding="15,10" />
+            <Button x:Name="DiscussionRetryButton" Content="Kiểm tra lại bài thảo luận"
+                    Click="OnRetryDiscussionClick" Padding="12,10" Margin="10,0,0,0" Visibility="Collapsed"/>
         </StackPanel>
 
         <!-- Hàng 1: Khu vực hiển thị Trạng thái (Log) -->
