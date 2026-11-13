@@ -40,7 +40,7 @@ public partial class MainWindow
     private async Task<PeerPdfPageState> ProbePeerPdfAsync(Uri peerUri, string action = "inspect", string? fileName = null,
         PeerPdfSubmissionMetadata? metadata = null)
     {
-        if (_workerClosing || _coursePauseInProgress || _courseJobCompletionReported) return new() { State = "STOPPED" };
+        if (_workerClosing || _coursePauseInProgress || _courseJobCompletionReported || ShouldSkipPeerPdfItems) return new() { State = "STOPPED" };
         if (_peerPdfRunJob != _centralWorkerClient.CurrentJob?.Id || _peerPdfRunUser != _courseraIdentity?.UserId)
             return new() { State = "STOPPED" };
         if (!IsSamePeerAssignmentActivity(peerUri)) return new() { State = "STALE_DOCUMENT" };
@@ -292,7 +292,7 @@ public partial class MainWindow
     }
 
     private bool PeerPdfJobCanAct(Uri peerUri) =>
-        !_workerClosing && !_coursePauseInProgress && !_courseJobCompletionReported && !IsInteractiveBrowseSession &&
+        !ShouldSkipPeerPdfItems && !_workerClosing && !_coursePauseInProgress && !_courseJobCompletionReported && !IsInteractiveBrowseSession &&
         _peerPdfRunJob == _centralWorkerClient.CurrentJob?.Id && _peerPdfRunUser == _courseraIdentity?.UserId &&
         IsSamePeerAssignmentActivity(peerUri);
 

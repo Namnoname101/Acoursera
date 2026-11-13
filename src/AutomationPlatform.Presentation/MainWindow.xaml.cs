@@ -154,7 +154,8 @@ public partial class MainWindow : Window
         StringComparison.OrdinalIgnoreCase);
 
     // Prepared PDFs and required peer reviews have separate guarded handlers.
-    private const bool ShouldSkipPeerReviewItems = false;
+    private bool ShouldSkipPeerReviewItems;
+    private bool ShouldSkipPeerPdfItems;
 
     public MainWindow(
         MainViewModel viewModel,
@@ -1920,6 +1921,7 @@ public partial class MainWindow : Window
                 const skipGradedAppItems = __SKIP_GRADED__;
                 const skipPracticeAppItems = __SKIP_PRACTICE__;
                 const skipPeerReviewItems = __SKIP_PEER__;
+                const skipPeerPdfItems = __SKIP_PEER_PDF__;
                 const pendingResultPaths = new Set(__PENDING_RESULT_PATHS__);
                 const submittedDiscussionPaths = new Set(__SUBMITTED_DISCUSSION_PATHS__);
                 const skippedLaunchAppItemPaths = new Set(__SKIPPED_LAUNCH_APP_PATHS__);
@@ -2055,7 +2057,8 @@ public partial class MainWindow : Window
                         skippedAppItems++;
                         continue;
                     }
-                    if (skipPeerReviewItems && isPeerReview) {
+                    if ((skipPeerReviewItems && isPeerReview) ||
+                        (skipPeerPdfItems && isPeerItem && !isPeerReview)) {
                         if (!isCompleted) skippedPeerItems++;
                         continue;
                     }
@@ -2097,6 +2100,7 @@ public partial class MainWindow : Window
             .Replace("__SKIP_GRADED__", ShouldSkipGradedAppItems ? "true" : "false")
             .Replace("__SKIP_PRACTICE__", ShouldSkipPracticeAppItems ? "true" : "false")
             .Replace("__SKIP_PEER__", ShouldSkipPeerReviewItems ? "true" : "false")
+            .Replace("__SKIP_PEER_PDF__", ShouldSkipPeerPdfItems ? "true" : "false")
             .Replace("__PENDING_RESULT_PATHS__", pendingResultPathsJson)
             .Replace("__SUBMITTED_DISCUSSION_PATHS__", submittedDiscussionPathsJson)
             .Replace("__SKIPPED_LAUNCH_APP_PATHS__", skippedLaunchAppItemPathsJson)
@@ -3589,6 +3593,7 @@ public partial class MainWindow : Window
                 var skipGradedAppItems = __SKIP_GRADED__;
                 var skipPracticeAppItems = __SKIP_PRACTICE__;
                 var skipPeerReviewItems = __SKIP_PEER__;
+                var skipPeerPdfItems = __SKIP_PEER_PDF__;
                 var deferredQuizPaths = new Set(__DEFERRED_QUIZ_PATHS__);
                 var pendingResultPaths = new Set(__PENDING_RESULT_PATHS__);
                 var submittedDiscussionPaths = new Set(__SUBMITTED_DISCUSSION_PATHS__);
@@ -3732,7 +3737,8 @@ public partial class MainWindow : Window
                         || /\bCompleted\b/i.test(ariaLabel)
                         || hasModernCompletedIcon);
 
-                    if (skipPeerReviewItems && isPeerReview) {
+                    if ((skipPeerReviewItems && isPeerReview) ||
+                        (skipPeerPdfItems && isPeerItem && !isPeerReview)) {
                         if (!isCompleted) skippedPeerItems++;
                         continue;
                     }
@@ -3886,6 +3892,7 @@ public partial class MainWindow : Window
             .Replace("__SKIP_GRADED__", ShouldSkipGradedAppItems ? "true" : "false")
             .Replace("__SKIP_PRACTICE__", ShouldSkipPracticeAppItems ? "true" : "false")
             .Replace("__SKIP_PEER__", ShouldSkipPeerReviewItems ? "true" : "false")
+            .Replace("__SKIP_PEER_PDF__", ShouldSkipPeerPdfItems ? "true" : "false")
             .Replace("__PENDING_RESULT_PATHS__", pendingResultPathsJson)
             .Replace("__SUBMITTED_DISCUSSION_PATHS__", submittedDiscussionPathsJson)
             .Replace("__SKIPPED_LAUNCH_APP_PATHS__", skippedLaunchAppItemPathsJson)
@@ -8695,6 +8702,7 @@ private Task<bool> HandlePdfFormSubmissionAsync(Uri peerActivityUri)
 
 	private async Task HandlePeerAssignmentAsync()
 	{
+		if (TrySkipConfiguredPeerActivity()) return;
 		if (_isHandlingPeerAssignment)
 		{
 			return;

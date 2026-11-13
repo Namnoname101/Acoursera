@@ -136,6 +136,7 @@ public partial class MainWindow
     }
 
     private bool PeerReviewCanAct(Uri expected) => !_workerClosing && !_coursePauseInProgress &&
+        !IsConfiguredPeerActivitySkipped(MainWebView.Source) &&
         !_courseJobCompletionReported && !IsInteractiveBrowseSession && IsCourseraUri(MainWebView.Source) &&
         PeerReviewAutomation.AssignmentPath(expected) is { } path &&
         string.Equals(path, PeerReviewAutomation.AssignmentPath(MainWebView.Source), StringComparison.OrdinalIgnoreCase);
@@ -238,6 +239,11 @@ public partial class MainWindow
     private async Task ContinueSubmittedPeerToReviewsAsync(Uri submissionUri)
     {
         if (!PeerReviewCanAct(submissionUri)) return;
+        if (ShouldSkipPeerReviewItems)
+        {
+            SkipPeerActivityToOutline(submissionUri, "đánh giá chéo sau bài nộp");
+            return;
+        }
         string? path = PeerReviewAutomation.AssignmentPath(submissionUri);
         if (path is null) return;
         TrackPendingPeerSubmission(path);
@@ -608,7 +614,8 @@ public partial class MainWindow
 
     private Task<bool> ReopenPendingPeerSubmissionAsync()
     {
-        if (_workerClosing || _coursePauseInProgress || _courseJobCompletionReported ||
+        if (ShouldSkipPeerPdfItems || ShouldSkipPeerReviewItems ||
+            _workerClosing || _coursePauseInProgress || _courseJobCompletionReported ||
             IsInteractiveBrowseSession || _centralWorkerClient.CurrentJob == null)
             return Task.FromResult(false);
 
