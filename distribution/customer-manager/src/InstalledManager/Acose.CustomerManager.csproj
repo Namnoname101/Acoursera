@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <AssemblyName>Acose.CustomerManager</AssemblyName>
+    <RootNamespace>Acose.CustomerManager</RootNamespace>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <EnableDefaultCompileItems>true</EnableDefaultCompileItems>
+    <Version>1.1.2</Version>
+    <Product>ACOSE · Quản lý khách hàng</Product>
+  </PropertyGroup>
+  <ItemGroup><FrameworkReference Include="Microsoft.AspNetCore.App" /></ItemGroup>
+</Project>

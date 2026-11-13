@@ -10,6 +10,7 @@
 | --- | --- | --- |
 | Automation Worker | `src/AutomationPlatform.Presentation` | Ứng dụng WPF chứa WebView2, đăng nhập/duyệt Coursera và xử lý luồng tự động hóa. Có thể chạy độc lập hoặc khởi chạy ở chế độ worker có điều phối. |
 | Account Manager | `src/AutomationPlatform.AccountManager` | Ứng dụng WPF quản lý profile trên máy, theo dõi worker, xếp hàng và giới hạn số worker chạy đồng thời. Đây là project độc lập, hiện chưa được thêm vào `src/AutomationPlatform.sln`. |
+| Customer Manager đang cài | `distribution/customer-manager/src/InstalledManager` | Mã nguồn tương ứng ứng dụng `D:\Acose\CustomerManager\Acose.CustomerManager.exe`. Có nút **Bỏ qua dạng bài** trên thanh công cụ; lựa chọn được lưu để dùng cho các khóa mở tiếp theo. |
 | Core projects | `src/AutomationPlatform.Domain`, `Application`, `Infrastructure` | Mô hình nghiệp vụ, luồng ứng dụng, lưu trữ và tích hợp trình duyệt. |
 | Order Entry | `tools/OrderSite` | Trang Fly độc lập để tạo/theo dõi đơn qua ACOSE Control Server. Xem [hướng dẫn riêng](tools/OrderSite/README.md). |
 
@@ -80,6 +81,8 @@ dotnet run --project .\src\AutomationPlatform.Presentation\AutomationPlatform.Pr
 Không commit API key, cookie, hồ sơ trình duyệt hay dữ liệu tài khoản vào Git. Nội dung được gửi đến AgentRouter/model khi dùng tính năng AI; hãy xem xét dữ liệu trước khi gửi.
 
 ## Cấu hình và dữ liệu cục bộ
+
+Với **Customer Manager đang cài**, bấm **Bỏ qua dạng bài** → chọn **PDF/Peer-graded** và/hoặc **đánh giá chéo** → **Lưu lựa chọn**. Thiết lập nằm trong `Data/activity-skips.json` bên cạnh chương trình. Dừng rồi chạy lại các khóa đang mở để dùng thiết lập mới. Hai biến `ACOSE_SKIP_PEER_PDF` và `ACOSE_SKIP_PEER_REVIEW` được Manager đặt riêng cho tiến trình Engine (`1` là bỏ qua, `0` là xử lý).
 
 - Thiết lập WebView và database mặc định nằm trong `src/AutomationPlatform.Presentation/appsettings.json`; database mặc định là `automation.db` theo working directory.
 - Account Manager ghi thiết lập trong `%LOCALAPPDATA%\Acose\AccountManager\settings.json`.

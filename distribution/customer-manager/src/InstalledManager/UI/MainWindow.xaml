@@ -1,0 +1,333 @@
+<Window x:Class="Acose.CustomerManager.UI.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:local="clr-namespace:Acose.CustomerManager.UI"
+        Title="ACOSE · Quản lý khách hàng" Width="1360" Height="880"
+        MinWidth="1100" MinHeight="740" WindowStartupLocation="CenterScreen"
+        Background="#F4F6FA" Foreground="#17243C" FontFamily="Segoe UI"
+        FontSize="14" Loaded="Window_Loaded" Closing="Window_Closing">
+    <Window.Resources>
+        <SolidColorBrush x:Key="Ink" Color="#17243C" />
+        <SolidColorBrush x:Key="Muted" Color="#68758B" />
+        <SolidColorBrush x:Key="Blue" Color="#245DDF" />
+        <SolidColorBrush x:Key="BorderColor" Color="#E0E6EF" />
+        <local:ProgressValueConverter x:Key="ProgressValue" />
+        <Style TargetType="Button">
+            <Setter Property="MinHeight" Value="38" />
+            <Setter Property="Padding" Value="15,8" />
+            <Setter Property="Background" Value="White" />
+            <Setter Property="Foreground" Value="#243650" />
+            <Setter Property="BorderBrush" Value="#D9E1ED" />
+            <Setter Property="BorderThickness" Value="1" />
+            <Setter Property="FontWeight" Value="SemiBold" />
+            <Setter Property="Cursor" Value="Hand" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border x:Name="ButtonBorder" CornerRadius="7" Padding="{TemplateBinding Padding}"
+                                BorderThickness="{TemplateBinding BorderThickness}" BorderBrush="{TemplateBinding BorderBrush}"
+                                Background="{TemplateBinding Background}">
+                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center" />
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="ButtonBorder" Property="Opacity" Value="0.82" />
+                            </Trigger>
+                            <Trigger Property="IsKeyboardFocused" Value="True">
+                                <Setter TargetName="ButtonBorder" Property="BorderBrush" Value="#245DDF" />
+                                <Setter TargetName="ButtonBorder" Property="BorderThickness" Value="2" />
+                            </Trigger>
+                            <Trigger Property="IsEnabled" Value="False">
+                                <Setter TargetName="ButtonBorder" Property="Opacity" Value="0.4" />
+                                <Setter Property="Cursor" Value="Arrow" />
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+        <Style x:Key="PrimaryButton" TargetType="Button" BasedOn="{StaticResource {x:Type Button}}">
+            <Setter Property="Background" Value="#245DDF" />
+            <Setter Property="Foreground" Value="White" />
+            <Setter Property="BorderBrush" Value="#245DDF" />
+        </Style>
+        <Style x:Key="StopButton" TargetType="Button" BasedOn="{StaticResource {x:Type Button}}">
+            <Setter Property="Background" Value="#FFF6F4" />
+            <Setter Property="Foreground" Value="#A94032" />
+            <Setter Property="BorderBrush" Value="#F0D8D3" />
+        </Style>
+        <Style x:Key="QuietButton" TargetType="Button" BasedOn="{StaticResource {x:Type Button}}">
+            <Setter Property="Background" Value="Transparent" />
+            <Setter Property="BorderBrush" Value="Transparent" />
+            <Setter Property="Foreground" Value="#536783" />
+        </Style>
+        <Style TargetType="TextBox">
+            <Setter Property="Padding" Value="11,9" />
+            <Setter Property="Background" Value="White" />
+            <Setter Property="BorderBrush" Value="#D9E1ED" />
+            <Setter Property="BorderThickness" Value="1" />
+            <Setter Property="VerticalContentAlignment" Value="Center" />
+            <Setter Property="SelectionBrush" Value="#AAC6FF" />
+        </Style>
+        <Style TargetType="ProgressBar">
+            <Setter Property="Height" Value="6" />
+            <Setter Property="Minimum" Value="0" />
+            <Setter Property="Maximum" Value="100" />
+            <Setter Property="Background" Value="#E7EDF7" />
+            <Setter Property="Foreground" Value="#3676EA" />
+            <Setter Property="BorderThickness" Value="0" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="ProgressBar">
+                        <Grid>
+                            <Border x:Name="PART_Track" Background="{TemplateBinding Background}" CornerRadius="3" />
+                            <Border x:Name="PART_Indicator" Background="{TemplateBinding Foreground}" CornerRadius="3" HorizontalAlignment="Left" />
+                        </Grid>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+        <Style TargetType="ToolTip">
+            <Setter Property="MaxWidth" Value="400" />
+        </Style>
+    </Window.Resources>
+    <Grid>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="86" />
+            <RowDefinition Height="*" />
+            <RowDefinition Height="44" />
+        </Grid.RowDefinitions>
+        <Border Background="White" BorderBrush="#E0E6EF" BorderThickness="0,0,0,1">
+            <Grid Margin="28,0">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto" />
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="Auto" />
+                </Grid.ColumnDefinitions>
+                <Border Width="43" Height="43" CornerRadius="12" Background="#172B50" VerticalAlignment="Center">
+                    <TextBlock Text="A" Foreground="White" FontSize="25" FontWeight="Bold" HorizontalAlignment="Center" VerticalAlignment="Center" />
+                </Border>
+                <StackPanel Grid.Column="1" Margin="13,0,20,0" VerticalAlignment="Center">
+                    <TextBlock Text="ACOSE" FontSize="12" FontWeight="Bold" Foreground="#526782" />
+                    <TextBlock Text="Quản lý khách hàng" FontSize="22" FontWeight="SemiBold" Margin="0,1,0,0" />
+                </StackPanel>
+                <StackPanel Grid.Column="2" Orientation="Horizontal" VerticalAlignment="Center">
+                    <Button x:Name="RefreshButton" Content="Nhận đơn mới" Click="Refresh_Click" Margin="0,0,9,0"
+                            AutomationProperties.Name="Nhận đơn khách hàng mới đã có trên máy"
+                            ToolTip="Nhận đơn mới đã có trên máy sau khi khách đăng nhập và xác nhận. Các link bạn đã chỉnh sửa được giữ trên máy." />
+                    <Button Content="Bỏ qua dạng bài" Click="ActivitySkips_Click" Margin="0,0,9,0"
+                            ToolTip="Chọn bỏ qua bài PDF/Peer-graded và đánh giá chéo cho các khóa mở tiếp theo." />
+                    <Button Content="Thiết lập" Click="Settings_Click" Style="{StaticResource QuietButton}"
+                            AutomationProperties.Name="Mở thiết lập nâng cao" />
+                </StackPanel>
+            </Grid>
+        </Border>
+        <Grid Grid.Row="1">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="310" />
+                <ColumnDefinition Width="*" />
+            </Grid.ColumnDefinitions>
+            <Border Background="#FAFBFD" BorderBrush="#E0E6EF" BorderThickness="0,0,1,0">
+                <Grid Margin="20,24,18,16">
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="*" />
+                        <RowDefinition Height="Auto" />
+                    </Grid.RowDefinitions>
+                    <Grid>
+                        <TextBlock Text="KHÁCH HÀNG" FontSize="12" FontWeight="Bold" Foreground="#6A7790" VerticalAlignment="Center" />
+                    </Grid>
+                    <TextBlock Grid.Row="1" Text="{Binding SummaryText}" FontSize="12" Foreground="#68758B" Margin="0,6,0,15" TextWrapping="Wrap" />
+                    <StackPanel Grid.Row="2">
+                        <TextBlock Text="Tìm theo tên hoặc link khóa học" FontSize="12" Foreground="#68758B" Margin="0,0,0,6" />
+                        <TextBox x:Name="SearchBox" Text="{Binding SearchText, UpdateSourceTrigger=PropertyChanged}" Height="40" Margin="0,0,0,14"
+                                 AutomationProperties.Name="Tìm khách hàng theo tên hoặc link khóa học" />
+                        <Button x:Name="AddOrderButton" Content="+  Thêm khách / đơn thủ công" Style="{StaticResource PrimaryButton}" Click="AddOrder_Click"
+                                HorizontalContentAlignment="Center" Margin="0,0,0,18" AutomationProperties.Name="Thêm khách hàng và mở đăng nhập mới" />
+                    </StackPanel>
+                    <ListBox x:Name="CustomerList" Grid.Row="3" ItemsSource="{Binding VisibleOrders}" SelectedItem="{Binding SelectedOrder}"
+                             Background="Transparent" BorderThickness="0" Padding="0" ScrollViewer.HorizontalScrollBarVisibility="Disabled"
+                             HorizontalContentAlignment="Stretch" AutomationProperties.Name="Danh sách khách hàng">
+                        <ListBox.ItemContainerStyle>
+                            <Style TargetType="ListBoxItem">
+                                <Setter Property="Margin" Value="0,0,0,8" />
+                                <Setter Property="Padding" Value="13,13" />
+                                <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+                                <Setter Property="Background" Value="Transparent" />
+                                <Setter Property="BorderBrush" Value="Transparent" />
+                                <Setter Property="BorderThickness" Value="1" />
+                                <Setter Property="Template">
+                                    <Setter.Value>
+                                        <ControlTemplate TargetType="ListBoxItem">
+                                            <Border x:Name="ItemBorder" CornerRadius="9" Background="{TemplateBinding Background}"
+                                                    BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="{TemplateBinding BorderThickness}"
+                                                    Padding="{TemplateBinding Padding}">
+                                                <ContentPresenter />
+                                            </Border>
+                                            <ControlTemplate.Triggers>
+                                                <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="ItemBorder" Property="Background" Value="#EFF3FA" /></Trigger>
+                                                <Trigger Property="IsSelected" Value="True">
+                                                    <Setter TargetName="ItemBorder" Property="Background" Value="#EDF3FF" />
+                                                    <Setter TargetName="ItemBorder" Property="BorderBrush" Value="#BFD0F4" />
+                                                </Trigger>
+                                                <Trigger Property="IsKeyboardFocusWithin" Value="True"><Setter TargetName="ItemBorder" Property="BorderBrush" Value="#245DDF" /></Trigger>
+                                            </ControlTemplate.Triggers>
+                                        </ControlTemplate>
+                                    </Setter.Value>
+                                </Setter>
+                            </Style>
+                        </ListBox.ItemContainerStyle>
+                        <ListBox.ItemTemplate>
+                            <DataTemplate>
+                                <StackPanel>
+                                    <TextBlock Text="{Binding Name}" FontWeight="SemiBold" TextWrapping="Wrap" FontSize="14" />
+                                    <TextBlock Text="{Binding SummaryText}" Foreground="#64748F" FontSize="12" Margin="0,5,0,10" />
+                                    <ProgressBar Value="{Binding OverallProgress, Mode=OneWay}" Height="5" AutomationProperties.Name="Tiến độ đơn" />
+                                </StackPanel>
+                            </DataTemplate>
+                        </ListBox.ItemTemplate>
+                    </ListBox>
+                    <Border Grid.Row="4" BorderBrush="#E0E6EF" BorderThickness="0,1,0,0" Padding="0,14,0,0" Margin="0,12,0,0">
+                        <TextBlock Text="Mỗi khách một đơn.&#x0a;Tên và link chỉnh sửa chỉ lưu trên máy này." Foreground="#738099" FontSize="12" TextWrapping="Wrap" LineHeight="18" />
+                    </Border>
+                </Grid>
+            </Border>
+            <Grid Grid.Column="1">
+                <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center" MaxWidth="390">
+                    <StackPanel.Style>
+                        <Style TargetType="StackPanel">
+                            <Setter Property="Visibility" Value="Collapsed" />
+                            <Style.Triggers><DataTrigger Binding="{Binding SelectedOrder}" Value="{x:Null}"><Setter Property="Visibility" Value="Visible" /></DataTrigger></Style.Triggers>
+                        </Style>
+                    </StackPanel.Style>
+                    <Border Width="68" Height="68" CornerRadius="20" Background="#E7EEFB" HorizontalAlignment="Center" Margin="0,0,0,20">
+                        <TextBlock FontFamily="Segoe MDL2 Assets" Text="&#xE77B;" Foreground="#426BAE" FontSize="28" HorizontalAlignment="Center" VerticalAlignment="Center" />
+                    </Border>
+                    <TextBlock Text="Chọn một khách để bắt đầu" FontSize="24" FontWeight="SemiBold" TextAlignment="Center" />
+                    <TextBlock Text="Nhận đơn mới đã có trên máy hoặc thêm đơn thủ công. Sau đó bạn có thể sửa link, chạy khóa học hoặc mở riêng để kiểm tra." Foreground="#68758B" TextWrapping="Wrap" TextAlignment="Center" Margin="0,12,0,0" LineHeight="22" />
+                </StackPanel>
+                <Grid x:Name="DetailPanel" DataContext="{Binding SelectedOrder}" Margin="28,24,28,20">
+                    <Grid.Style>
+                        <Style TargetType="Grid">
+                            <Setter Property="Visibility" Value="Visible" />
+                            <Style.Triggers><DataTrigger Binding="{Binding}" Value="{x:Null}"><Setter Property="Visibility" Value="Collapsed" /></DataTrigger></Style.Triggers>
+                        </Style>
+                    </Grid.Style>
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="*" />
+                    </Grid.RowDefinitions>
+                    <Grid Margin="0,0,0,17">
+                        <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
+                        <StackPanel>
+                            <TextBlock Text="ĐƠN CỦA KHÁCH" Foreground="#68758B" FontSize="11" FontWeight="Bold" Margin="0,0,0,6" />
+                            <TextBlock Text="{Binding Name}" FontSize="26" FontWeight="SemiBold" TextWrapping="Wrap" />
+                        </StackPanel>
+                        <Button Grid.Column="1" Content="Sửa họ tên" Click="Rename_Click" Style="{StaticResource QuietButton}" VerticalAlignment="Bottom" Margin="12,0,0,0" />
+                    </Grid>
+                    <Border Grid.Row="1" Background="White" BorderBrush="#E0E6EF" BorderThickness="1" CornerRadius="10" Padding="19,16" Margin="0,0,0,16">
+                        <Grid>
+                            <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
+                            <StackPanel Margin="0,0,20,0">
+                                <TextBlock Text="Tài khoản Coursera" FontWeight="SemiBold" />
+                                <TextBlock Text="{Binding SessionNote}" Foreground="#68758B" Margin="0,5,0,0" TextWrapping="Wrap" FontSize="13" />
+                            </StackPanel>
+                            <Button Grid.Column="1" Content="Mở đăng nhập" Click="Login_Click" VerticalAlignment="Center"
+                                    ToolTip="Mở tài khoản của khách này để đăng nhập hoặc kiểm tra phiên đăng nhập.">
+                                <Button.Style>
+                                    <Style TargetType="Button" BasedOn="{StaticResource {x:Type Button}}">
+                                        <Style.Triggers><DataTrigger Binding="{Binding SessionBusy}" Value="True"><Setter Property="IsEnabled" Value="False" /></DataTrigger></Style.Triggers>
+                                    </Style>
+                                </Button.Style>
+                            </Button>
+                        </Grid>
+                    </Border>
+                    <Grid Grid.Row="2" Margin="0,0,0,15">
+                        <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
+                        <StackPanel VerticalAlignment="Center" Margin="0,0,14,0">
+                            <TextBlock Text="{Binding SummaryText}" FontSize="17" FontWeight="SemiBold" />
+                            <ProgressBar Value="{Binding OverallProgress, Mode=OneWay}" Margin="0,9,0,0" Width="270" HorizontalAlignment="Left" />
+                        </StackPanel>
+                        <WrapPanel Grid.Column="1" VerticalAlignment="Center" HorizontalAlignment="Right">
+                            <Button Content="+  Thêm link" Click="AddLinks_Click" Margin="0,0,8,0" />
+                            <Button Content="Chạy cả đơn" Click="StartOrder_Click" Style="{StaticResource PrimaryButton}" Margin="0,0,8,0"
+                                    ToolTip="Chạy đồng thời các khóa của khách này, theo số khóa tối đa trong Thiết lập." />
+                            <Button Content="Dừng cả đơn" Click="StopOrder_Click" Style="{StaticResource StopButton}" />
+                        </WrapPanel>
+                    </Grid>
+                    <TextBlock Grid.Row="3" Foreground="#74829A" FontSize="12" Margin="0,0,0,14" TextWrapping="Wrap" LineHeight="19"
+                               Text="Hiện/Ẩn: bật/tắt cửa sổ Worker đang chạy, không dừng khóa. Mở kiểm tra: thao tác bằng tay. “Xong auto” có thể vẫn còn nội dung chờ chấm điểm." />
+                    <Grid Grid.Row="4">
+                        <Border Background="White" CornerRadius="10" BorderBrush="#E0E6EF" BorderThickness="1" Padding="25" VerticalAlignment="Top">
+                            <Border.Style>
+                                <Style TargetType="Border"><Setter Property="Visibility" Value="Collapsed" /><Style.Triggers><DataTrigger Binding="{Binding Courses.Count}" Value="0"><Setter Property="Visibility" Value="Visible" /></DataTrigger></Style.Triggers></Style>
+                            </Border.Style>
+                            <StackPanel>
+                                <TextBlock Text="Đơn này chưa có link khóa học" FontSize="18" FontWeight="SemiBold" />
+                                <TextBlock Text="Bấm “Thêm link” và dán các link khách đã gửi, mỗi dòng một link." Foreground="#68758B" Margin="0,8,0,0" TextWrapping="Wrap" />
+                            </StackPanel>
+                        </Border>
+                        <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled" Padding="0,0,5,0">
+                            <ItemsControl ItemsSource="{Binding Courses}">
+                                <ItemsControl.ItemTemplate>
+                                    <DataTemplate>
+                                        <Border Background="White" BorderBrush="#E0E6EF" BorderThickness="1" CornerRadius="10" Padding="18,15" Margin="0,0,0,12">
+                                            <Grid>
+                                                <Grid.RowDefinitions><RowDefinition Height="Auto" /><RowDefinition Height="Auto" /><RowDefinition Height="Auto" /></Grid.RowDefinitions>
+                                                <Grid>
+                                                    <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
+                                                    <StackPanel Margin="0,0,16,0">
+                                                        <TextBlock Text="LINK KHÓA HỌC" Foreground="#8290A5" FontWeight="SemiBold" FontSize="10" Margin="0,0,0,5" />
+                                                        <TextBlock Text="{Binding Url}" TextWrapping="Wrap" Foreground="#26487B" FontWeight="SemiBold" FontSize="14" ToolTip="{Binding Url}" />
+                                                    </StackPanel>
+                                                    <Border Grid.Column="1" CornerRadius="5" Background="#EFF3F9" Padding="9,5" VerticalAlignment="Top" MaxWidth="220">
+                                                        <Border.Style>
+                                                            <Style TargetType="Border">
+                                                                <Style.Triggers><DataTrigger Binding="{Binding IsRunning}" Value="True"><Setter Property="Background" Value="#E9F1FF" /></DataTrigger></Style.Triggers>
+                                                            </Style>
+                                                        </Border.Style>
+                                                        <TextBlock Text="{Binding StatusText}" FontSize="12" Foreground="#4A6287" TextWrapping="Wrap" />
+                                                    </Border>
+                                                </Grid>
+                                                <Grid Grid.Row="1" Margin="0,13,0,12">
+                                                    <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
+                                                    <ProgressBar Value="{Binding Progress, Mode=OneWay, Converter={StaticResource ProgressValue}}" VerticalAlignment="Center" Margin="0,0,13,0" />
+                                                    <TextBlock Grid.Column="1" Text="{Binding ProgressText}" Foreground="#536A8D" FontSize="12" VerticalAlignment="Center" />
+                                                </Grid>
+                                                <StackPanel Grid.Row="2">
+                                                    <TextBlock Text="{Binding Activity}" Foreground="#7A879B" FontSize="12" TextWrapping="Wrap" MaxHeight="42" />
+                                                    <WrapPanel Margin="0,8,0,0">
+                                                        <Button Content="Sửa link" Click="EditLink_Click" IsEnabled="{Binding CanEdit}" Padding="11,6" MinHeight="34" Margin="0,0,5,0" />
+                                                        <Button Content="Mở kiểm tra" Click="OpenCourse_Click" Padding="11,6" MinHeight="34" Margin="0,0,5,0" ToolTip="Mở đúng tài khoản và khóa này để bạn kiểm tra bằng tay. Không tự chạy." />
+                                                        <Button Content="Chạy" Click="StartCourse_Click" IsEnabled="{Binding CanStart}" Style="{StaticResource PrimaryButton}" Padding="13,6" MinHeight="34" Margin="0,0,5,0" />
+                                                        <Button Content="{Binding WorkerWindowButtonText}" Click="ToggleWorkerWindow_Click" IsEnabled="{Binding CanToggleWorkerWindow}" ToolTip="{Binding WorkerWindowToolTip}" ToolTipService.ShowOnDisabled="True" Padding="13,6" MinHeight="34" Margin="0,0,5,0" />
+                                                        <Button Content="Dừng" Click="StopCourse_Click" IsEnabled="{Binding CanStop}" Style="{StaticResource StopButton}" Padding="11,6" MinHeight="34" Margin="0,0,2,0" />
+                                                        <Button Content="×" Click="RemoveLink_Click" IsEnabled="{Binding CanEdit}" Style="{StaticResource QuietButton}" Padding="8,4" MinHeight="34" FontSize="20" FontWeight="Normal" ToolTip="Xóa link khỏi đơn trên máy này" AutomationProperties.Name="Xóa link khỏi đơn" />
+                                                    </WrapPanel>
+                                                </StackPanel>
+                                            </Grid>
+                                        </Border>
+                                    </DataTemplate>
+                                </ItemsControl.ItemTemplate>
+                            </ItemsControl>
+                        </ScrollViewer>
+                    </Grid>
+                </Grid>
+            </Grid>
+        </Grid>
+        <Border Grid.Row="2" Background="White" BorderBrush="#E0E6EF" BorderThickness="0,1,0,0" Padding="24,0">
+            <Grid>
+                <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
+                <TextBlock x:Name="StatusLabel" Text="{Binding StatusMessage}" Foreground="#60728D" FontSize="12" VerticalAlignment="Center" TextTrimming="CharacterEllipsis" ToolTip="{Binding StatusMessage}" AutomationProperties.LiveSetting="Polite" />
+                <TextBlock Grid.Column="1" Text="Đang xử lý…" Foreground="#245DDF" FontSize="12" Margin="16,0,0,0" VerticalAlignment="Center">
+                    <TextBlock.Style><Style TargetType="TextBlock"><Setter Property="Visibility" Value="Collapsed" /><Style.Triggers><DataTrigger Binding="{Binding IsBusy}" Value="True"><Setter Property="Visibility" Value="Visible" /></DataTrigger></Style.Triggers></Style></TextBlock.Style>
+                </TextBlock>
+            </Grid>
+        </Border>
+    </Grid>
+</Window>

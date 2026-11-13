@@ -168,6 +168,10 @@ public partial class MainWindow : Window
         _aiCompletionService = aiCompletionService;
         _workerLaunchOptions = workerLaunchOptions;
         _centralWorkerClient = centralWorkerClient;
+        ShouldSkipPeerPdfItems = Environment.GetEnvironmentVariable("ACOSE_SKIP_PEER_PDF") == "1";
+        ShouldSkipPeerReviewItems = Environment.GetEnvironmentVariable("ACOSE_SKIP_PEER_REVIEW") == "1";
+        SkipPeerPdfCheckBox.IsChecked = ShouldSkipPeerPdfItems;
+        SkipPeerReviewCheckBox.IsChecked = ShouldSkipPeerReviewItems;
         _workerClaimPending = _workerLaunchOptions.IsInteractiveProfile;
         DataContext = _viewModel;
 
